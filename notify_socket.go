@@ -15,16 +15,18 @@ import (
 )
 
 type notifySocket struct {
-	socket     *net.UnixConn
-	host       string
-	socketPath string
+	socket     *net.UnixConn /*构造的socket*/
+	host       string/*所属host*/
+	socketPath string/*socketk路径*/
 }
 
+/*生成notifySocket对象*/
 func newNotifySocket(context *cli.Context, notifySocketHost string, id string) *notifySocket {
 	if notifySocketHost == "" {
 		return nil
 	}
 
+	/*$root合上id，再合上notify/notify.sock生成socket路径*/
 	root := filepath.Join(context.GlobalString("root"), id)
 	socketPath := filepath.Join(root, "notify", "notify.sock")
 
@@ -60,6 +62,7 @@ func (s *notifySocket) bindSocket() error {
 		Net:  "unixgram",
 	}
 
+	/*创建并绑定unix socket*/
 	socket, err := net.ListenUnixgram("unixgram", &addr)
 	if err != nil {
 		return err
@@ -75,6 +78,7 @@ func (s *notifySocket) bindSocket() error {
 	return nil
 }
 
+/*创建socket对应的目录*/
 func (s *notifySocket) setupSocketDirectory() error {
 	return os.Mkdir(path.Dir(s.socketPath), 0o755)
 }

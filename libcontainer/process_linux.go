@@ -45,6 +45,7 @@ type parentProcess interface {
 	forwardChildLogs() chan error
 }
 
+/*父子进程对应的pipe两端*/
 type filePair struct {
 	parent *os.File
 	child  *os.File
@@ -235,6 +236,8 @@ func (p *setnsProcess) execSetns() error {
 		_ = p.cmd.Wait()
 		return &exec.ExitError{ProcessState: status}
 	}
+	
+	/*获得子进程pid*/
 	var pid *pid
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
 		_ = p.cmd.Wait()
@@ -318,6 +321,7 @@ func (p *initProcess) externalDescriptors() []string {
 // getChildPid receives the final child's pid over the provided pipe.
 func (p *initProcess) getChildPid() (int, error) {
 	var pid pid
+	/*读取pid*/
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
 		_ = p.cmd.Wait()
 		return -1, err
@@ -355,6 +359,7 @@ func (p *initProcess) waitForChildExit(childPid int) error {
 
 func (p *initProcess) start() (retErr error) {
 	defer p.messageSockPair.parent.Close() //nolint: errcheck
+	/*启动命令*/
 	err := p.cmd.Start()
 	p.process.ops = p
 	// close the write-side of the pipes (controlled by child)
@@ -649,6 +654,7 @@ func (p *initProcess) updateSpecState() error {
 	return nil
 }
 
+/*发送配置给子进程*/
 func (p *initProcess) sendConfig() error {
 	// send the config to the container's init process, we don't use JSON Encode
 	// here because there might be a problem in JSON decoder in some cases, see:

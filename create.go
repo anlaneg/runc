@@ -7,6 +7,7 @@ import (
 	"github.com/urfave/cli"
 )
 
+/*执行create命令*/
 var createCommand = cli.Command{
 	Name:  "create",
 	Usage: "create a container",
@@ -53,9 +54,11 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 		},
 	},
 	Action: func(context *cli.Context) error {
+		/*执行参数校验，只能有一个参数*/
 		if err := checkArgs(context, 1, exactArgs); err != nil {
 			return err
 		}
+		/*创建container*/
 		status, err := startContainer(context, CT_ACT_CREATE, nil)
 		if err == nil {
 			// exit with the container's exit status so any external supervisor

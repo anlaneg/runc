@@ -29,29 +29,38 @@ func New(config *configs.Cgroup) (cgroups.Manager, error) {
 // is the unified cgroup path.
 func NewWithPaths(config *configs.Cgroup, paths map[string]string) (cgroups.Manager, error) {
 	if config == nil {
+		/*config不能为nil*/
 		return nil, errors.New("cgroups/manager.New: config must not be nil")
 	}
+	
+	/*指明了systemd,但本机的systemd未运行*/
 	if config.Systemd && !systemd.IsRunningSystemd() {
 		return nil, errors.New("systemd not running on this host, cannot use systemd cgroups manager")
 	}
 
 	// Cgroup v2 aka unified hierarchy.
 	if cgroups.IsCgroup2UnifiedMode() {
+		/*针对cgroup v2 unified Mode处理*/
 		path, err := getUnifiedPath(paths)
 		if err != nil {
 			return nil, fmt.Errorf("manager.NewWithPaths: inconsistent paths: %w", err)
 		}
 		if config.Systemd {
+			/*针对cgroup v2版本，通过systemd管理*/
 			return systemd.NewUnifiedManager(config, path)
 		}
+		
+		/*直接产生v2的manger*/
 		return fs2.NewManager(config, path)
 	}
 
 	// Cgroup v1.
 	if config.Systemd {
+		/*针对cgroup v1版本，通过systemd管理*/
 		return systemd.NewLegacyManager(config, paths)
 	}
 
+	/*直接产生v1的manger*/
 	return fs.NewManager(config, paths)
 }
 

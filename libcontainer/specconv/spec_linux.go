@@ -319,6 +319,7 @@ type CreateOpts struct {
 // to be absolute and clean.
 func getwd() (wd string, err error) {
 	for {
+		/*取当前工作目录*/
 		wd, err = unix.Getwd()
 		//nolint:errorlint // unix errors are bare
 		if err != unix.EINTR {
@@ -338,16 +339,22 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	}
 	spec := opts.Spec
 	if spec.Root == nil {
+		/*spec.Root不能为空*/
 		return nil, errors.New("root must be specified")
 	}
 	rootfsPath := spec.Root.Path
 	if !filepath.IsAbs(rootfsPath) {
+		/*如果rootfsPath不是绝对路径，则为其添加cwd构造成绝对路径*/
 		rootfsPath = filepath.Join(cwd, rootfsPath)
 	}
+	
+	/*遍历spec.Annotations生成labels*/
 	labels := []string{}
 	for k, v := range spec.Annotations {
 		labels = append(labels, k+"="+v)
 	}
+	
+	/*构造config*/
 	config := &configs.Config{
 		Rootfs:          rootfsPath,
 		NoPivotRoot:     opts.NoPivotRoot,
@@ -359,6 +366,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		RootlessCgroups: opts.RootlessCgroups,
 	}
 
+	/*填充config.Mounts*/
 	for _, m := range spec.Mounts {
 		cm, err := createLibcontainerMount(cwd, m)
 		if err != nil {
@@ -367,11 +375,12 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		config.Mounts = append(config.Mounts, cm)
 	}
 
+	/*填充cgroups*/
 	defaultDevs, err := createDevices(spec, config)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	c, err := CreateCgroupConfig(opts, defaultDevs)
 	if err != nil {
 		return nil, err
@@ -1086,10 +1095,13 @@ func SetupSeccomp(config *specs.LinuxSeccomp) (*configs.Seccomp, error) {
 func createHooks(rspec *specs.Spec, config *configs.Config) {
 	config.Hooks = configs.Hooks{}
 	if rspec.Hooks != nil {
+		/*添加prestart hook*/
 		for _, h := range rspec.Hooks.Prestart {
 			cmd := createCommandHook(h)
 			config.Hooks[configs.Prestart] = append(config.Hooks[configs.Prestart], configs.NewCommandHook(cmd))
 		}
+		
+		/*添加create runtime hook*/
 		for _, h := range rspec.Hooks.CreateRuntime {
 			cmd := createCommandHook(h)
 			config.Hooks[configs.CreateRuntime] = append(config.Hooks[configs.CreateRuntime], configs.NewCommandHook(cmd))

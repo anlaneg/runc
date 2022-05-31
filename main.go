@@ -53,10 +53,12 @@ value for "bundle" is the current directory.`
 )
 
 func main() {
+	/*初始化命令行*/
 	app := cli.NewApp()
 	app.Name = "runc"
 	app.Usage = usage
 
+	/*构造版本情况(含各组件版本），按回车划分*/
 	v := []string{version}
 
 	if gitCommit != "" {
@@ -71,6 +73,7 @@ func main() {
 	}
 	app.Version = strings.Join(v, "\n")
 
+	/*指明默认root*/
 	root := "/run/runc"
 	xdgDirUsed := false
 	xdgRuntimeDir := os.Getenv("XDG_RUNTIME_DIR")
@@ -114,6 +117,8 @@ func main() {
 			Usage: "ignore cgroup permission errors ('true', 'false', or 'auto')",
 		},
 	}
+	
+	/*定义支持的命令*/
 	app.Commands = []cli.Command{
 		checkpointCommand,
 		createCommand,
@@ -162,6 +167,7 @@ func main() {
 	// the error on cli.ErrWriter and exit.
 	// Use our own writer here to ensure the log gets sent to the right location.
 	cli.ErrWriter = &FatalWriter{cli.ErrWriter}
+	/*解析命令行并运行*/
 	if err := app.Run(os.Args); err != nil {
 		fatal(err)
 	}

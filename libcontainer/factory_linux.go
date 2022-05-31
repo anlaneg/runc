@@ -40,15 +40,22 @@ var idRegex = regexp.MustCompile(`^[\w+-\.]+$`)
 // ASCII letters, digits, underscore, plus, minus, period. The id must be
 // unique and non-existent for the given root path.
 func Create(root, id string, config *configs.Config) (*Container, error) {
+	/*root不能为空*/
 	if root == "" {
 		return nil, errors.New("root not set")
 	}
+	
+	/*container id格式校验*/
 	if err := validateID(id); err != nil {
 		return nil, err
 	}
+	
+	/*config校验*/
 	if err := validate.Validate(config); err != nil {
 		return nil, err
 	}
+	
+	/*创建root对应的目录,例如/run/runc*/
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
@@ -56,12 +63,17 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	/*取containerRoot的stat*/
 	if _, err := os.Stat(containerRoot); err == nil {
+		/*目录已存在，报错*/
 		return nil, ErrExist
 	} else if !os.IsNotExist(err) {
+		/*遇到其它非目录不存在问题，报错*/
 		return nil, err
 	}
 
+	/*创建cgroup manager*/
 	cm, err := manager.New(config.Cgroups)
 	if err != nil {
 		return nil, err
@@ -97,9 +109,12 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	}
 
 	// Parent directory is already created above, so Mkdir is enough.
+	/*创建containerRoot,例如/run/runc/$id*/
 	if err := os.Mkdir(containerRoot, 0o711); err != nil {
 		return nil, err
 	}
+	
+	/*创建container对象*/
 	c := &Container{
 		id:              id,
 		root:            containerRoot,
@@ -262,6 +277,7 @@ func loadState(root string) (*State, error) {
 }
 
 func validateID(id string) error {
+	/*id由字每，'.','-'组成，防路径理解不一致*/
 	if !idRegex.MatchString(id) || string(os.PathSeparator)+id != utils.CleanPath(string(os.PathSeparator)+id) {
 		return ErrInvalidID
 	}

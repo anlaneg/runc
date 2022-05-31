@@ -22,6 +22,7 @@ import (
 // to a file being opened.
 func OpenFile(dir, file string, flags int) (*os.File, error) {
 	if dir == "" {
+		/*dir不能为空*/
 		return nil, fmt.Errorf("no directory specified for %s", file)
 	}
 	return openFile(dir, file, flags)

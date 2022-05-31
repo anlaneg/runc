@@ -25,6 +25,7 @@ func checkArgs(context *cli.Context, expected, checkType int) error {
 	cmdName := context.Command.Name
 	switch checkType {
 	case exactArgs:
+		/*参数数量与预期的不一致，报错*/
 		if context.NArg() != expected {
 			err = fmt.Errorf("%s: %q requires exactly %d argument(s)", os.Args[0], cmdName, expected)
 		}
@@ -71,10 +72,12 @@ func fatalWithCode(err error, ret int) {
 func setupSpec(context *cli.Context) (*specs.Spec, error) {
 	bundle := context.String("bundle")
 	if bundle != "" {
+		/*如果bundle有值，则划换工作目录到bundle指定的位置*/
 		if err := os.Chdir(bundle); err != nil {
 			return nil, err
 		}
 	}
+	/*加载config.json，获得spec对象*/
 	spec, err := loadSpec(specConfig)
 	if err != nil {
 		return nil, err
@@ -85,15 +88,18 @@ func setupSpec(context *cli.Context) (*specs.Spec, error) {
 func revisePidFile(context *cli.Context) error {
 	pidFile := context.String("pid-file")
 	if pidFile == "" {
+		/*未指定pid-file,返回nil*/
 		return nil
 	}
 
 	// convert pid-file to an absolute path so we can write to the right
 	// file after chdir to bundle
+	/*转换并设置pidfile的绝对路径*/
 	pidFile, err := filepath.Abs(pidFile)
 	if err != nil {
 		return err
 	}
+	
 	return context.Set("pid-file", pidFile)
 }
 
@@ -122,9 +128,11 @@ func reviseRootDir(context *cli.Context) error {
 
 // parseBoolOrAuto returns (nil, nil) if s is empty or "auto"
 func parseBoolOrAuto(s string) (*bool, error) {
+	/*如果s为空或者为auto,则返回nil*/
 	if s == "" || strings.ToLower(s) == "auto" {
 		return nil, nil
 	}
+	/*否则将s转bool类型*/
 	b, err := strconv.ParseBool(s)
 	return &b, err
 }

@@ -34,6 +34,7 @@ var (
 func IsCgroup2UnifiedMode() bool {
 	isUnifiedOnce.Do(func() {
 		var st unix.Statfs_t
+		/*取/sys/fs/cgroup的file system stat*/
 		err := unix.Statfs(unifiedMountpoint, &st)
 		if err != nil {
 			if os.IsNotExist(err) && userns.RunningInUserNS() {
@@ -44,6 +45,7 @@ func IsCgroup2UnifiedMode() bool {
 			}
 			panic(fmt.Sprintf("cannot statfs cgroup root: %s", err))
 		}
+		/*通过st type检查是否为unified类型*/
 		isUnified = st.Type == unix.CGROUP2_SUPER_MAGIC
 	})
 	return isUnified
@@ -137,6 +139,7 @@ func GetAllSubsystems() ([]string, error) {
 }
 
 func readProcsFile(dir string) ([]int, error) {
+	/*打开process文件，读取各个进程id*/
 	f, err := OpenFile(dir, CgroupProcesses, os.O_RDONLY)
 	if err != nil {
 		return nil, err
@@ -208,6 +211,7 @@ func parseCgroupFromReader(r io.Reader) (map[string]string, error) {
 	return cgroups, nil
 }
 
+/*检查path是否存在*/
 func PathExists(path string) bool {
 	if _, err := os.Stat(path); err != nil {
 		return false

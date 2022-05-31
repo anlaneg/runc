@@ -12,22 +12,29 @@ import (
 // Example returns an example spec file, with many options set so a user can
 // see what a standard spec file looks like.
 func Example() *specs.Spec {
+	/*返回一个示例用的spec文件内容*/
 	spec := &specs.Spec{
 		Version: specs.Version,
+		/*指明根路径*/
 		Root: &specs.Root{
 			Path:     "rootfs",
 			Readonly: true,
 		},
 		Process: &specs.Process{
+			/*指明采用交互式terminal*/
 			Terminal: true,
+			/*默认为root*/
 			User:     specs.User{},
+			/*要执行的命令行及参数*/
 			Args: []string{
 				"sh",
 			},
+			/*要为进程传入的环境变量*/
 			Env: []string{
 				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 				"TERM=xterm",
 			},
+			/*工作目录为'/'*/
 			Cwd:             "/",
 			NoNewPrivileges: true,
 			Capabilities: &specs.LinuxCapabilities{
@@ -52,6 +59,7 @@ func Example() *specs.Spec {
 					"CAP_NET_BIND_SERVICE",
 				},
 			},
+			/*指定的limit配置*/
 			Rlimits: []specs.POSIXRlimit{
 				{
 					Type: "RLIMIT_NOFILE",
@@ -60,7 +68,9 @@ func Example() *specs.Spec {
 				},
 			},
 		},
+		/*指定主机名*/
 		Hostname: "runc",
+		/*要挂载的目录*/
 		Mounts: []specs.Mount{
 			{
 				Destination: "/proc",

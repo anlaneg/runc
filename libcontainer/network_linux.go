@@ -30,6 +30,7 @@ type networkStrategy interface {
 func getStrategy(tpe string) (networkStrategy, error) {
 	s, exists := strategies[tpe]
 	if !exists {
+		/*遇到不认识的type,报错*/
 		return nil, fmt.Errorf("unknown strategy type %q", tpe)
 	}
 	return s, nil
@@ -73,6 +74,7 @@ func getNetworkInterfaceStats(interfaceName string) (*types.NetworkInterface, er
 
 // Reads the specified statistics available under /sys/class/net/<EthInterface>/statistics
 func readSysfsNetworkStats(ethInterface, statsFile string) (uint64, error) {
+	/*读取网络状态*/
 	data, err := os.ReadFile(filepath.Join("/sys/class/net", ethInterface, "statistics", statsFile))
 	if err != nil {
 		return 0, err
@@ -88,6 +90,7 @@ func (l *loopback) create(n *network, nspid int) error {
 }
 
 func (l *loopback) initialize(config *network) error {
+	/*创建lo设备*/
 	return netlink.LinkSetUp(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "lo"}})
 }
 

@@ -46,17 +46,18 @@ func getDefaultImagePath() string {
 // spec and stdio from the current process.
 func newProcess(p specs.Process) (*libcontainer.Process, error) {
 	lp := &libcontainer.Process{
-		Args: p.Args,
-		Env:  p.Env,
+		Args: p.Args,/*参数*/
+		Env:  p.Env,/*环境变量*/
 		// TODO: fix libcontainer's API to better support uid/gid in a typesafe way.
 		User:            fmt.Sprintf("%d:%d", p.User.UID, p.User.GID),
-		Cwd:             p.Cwd,
+		Cwd:             p.Cwd,/*工作目录*/
 		Label:           p.SelinuxLabel,
 		NoNewPrivileges: &p.NoNewPrivileges,
 		AppArmorProfile: p.ApparmorProfile,
 	}
 
 	if p.ConsoleSize != nil {
+		/*设置各console的width,height*/
 		lp.ConsoleWidth = uint16(p.ConsoleSize.Width)
 		lp.ConsoleHeight = uint16(p.ConsoleSize.Height)
 	}
@@ -94,6 +95,7 @@ func setupIO(process *libcontainer.Process, rootuid, rootgid int, createTTY, det
 		process.Stdin = nil
 		process.Stdout = nil
 		process.Stderr = nil
+		/*构造tty对象*/
 		t := &tty{}
 		if !detach {
 			if err := t.initHostConsole(); err != nil {
@@ -162,11 +164,13 @@ func createPidFile(path string, process *libcontainer.Process) error {
 	return os.Rename(tmpName, path)
 }
 
-func createContainer(context *cli.Context, id string, spec *specs.Spec) (*libcontainer.Container, error) {
+func createContainer(context *cli.Context, id string/*container id*/, spec *specs.Spec/*container配置*/) (*libcontainer.Container, error) {
 	rootlessCg, err := shouldUseRootlessCgroupManager(context)
 	if err != nil {
 		return nil, err
 	}
+	
+	/*生成config对象*/
 	config, err := specconv.CreateLibcontainerConfig(&specconv.CreateOpts{
 		CgroupName:       id,
 		UseSystemdCgroup: context.GlobalBool("systemd-cgroup"),
@@ -180,6 +184,7 @@ func createContainer(context *cli.Context, id string, spec *specs.Spec) (*libcon
 		return nil, err
 	}
 
+	/*通过factory_linux.go的Create函数，生成container对象*/
 	root := context.GlobalString("root")
 	return libcontainer.Create(root, id, config)
 }
@@ -200,16 +205,22 @@ type runner struct {
 	subCgroupPaths  map[string]string
 }
 
+/*负责运行指定的container*/
 func (r *runner) run(config *specs.Process) (int, error) {
 	var err error
 	defer func() {
+		/*err不为nil时，执行destroy回调*/
 		if err != nil {
 			r.destroy()
 		}
 	}()
+	
+	/*检查terminal配置*/
 	if err = r.checkTerminal(config); err != nil {
 		return -1, err
 	}
+	
+	/*构造libcontainer.Process*/
 	process, err := newProcess(*config)
 	if err != nil {
 		return -1, err
@@ -251,10 +262,12 @@ func (r *runner) run(config *specs.Process) (int, error) {
 
 	switch r.action {
 	case CT_ACT_CREATE:
+		/*执行create*/
 		err = r.container.Start(process)
 	case CT_ACT_RESTORE:
 		err = r.container.Restore(process, r.criuOpts)
 	case CT_ACT_RUN:
+		/*执行run*/
 		err = r.container.Run(process)
 	default:
 		panic("Unknown action")
@@ -298,12 +311,15 @@ func (r *runner) terminate(p *libcontainer.Process) {
 }
 
 func (r *runner) checkTerminal(config *specs.Process) error {
+	/*是否为detach方式*/
 	detach := r.detach || (r.action == CT_ACT_CREATE)
 	// Check command-line for sanity.
 	if detach && config.Terminal && r.consoleSocket == "" {
+		/*指明了detach,但terminal为true,且consoleSocket为空*/
 		return errors.New("cannot allocate tty if runc will detach without setting console socket")
 	}
 	if (!detach || !config.Terminal) && r.consoleSocket != "" {
+		/*consoleSocket配置情况下，terminal/detach为false时报错*/
 		return errors.New("cannot use console socket if runc will not detach or allocate tty")
 	}
 	return nil
@@ -311,18 +327,23 @@ func (r *runner) checkTerminal(config *specs.Process) error {
 
 func validateProcessSpec(spec *specs.Process) error {
 	if spec == nil {
+		/*不得为空*/
 		return errors.New("process property must not be empty")
 	}
 	if spec.Cwd == "" {
+		/*cwd必须被配置*/
 		return errors.New("Cwd property must not be empty")
 	}
 	if !filepath.IsAbs(spec.Cwd) {
+		/*cwd必须为绝对路径*/
 		return errors.New("Cwd must be an absolute path")
 	}
 	if len(spec.Args) == 0 {
+		/*参数不得为0*/
 		return errors.New("args must not be empty")
 	}
 	if spec.SelinuxLabel != "" && !selinux.GetEnabled() {
+		/*selinux是否配置与是否开启检查*/
 		return errors.New("selinux label is specified in config, but selinux is disabled or not supported")
 	}
 	return nil
@@ -336,35 +357,41 @@ const (
 	CT_ACT_RESTORE
 )
 
-func startContainer(context *cli.Context, action CtAct, criuOpts *libcontainer.CriuOpts) (int, error) {
+func startContainer(context *cli.Context, action CtAct/*要执行的操作*/, criuOpts *libcontainer.CriuOpts) (int, error) {
 	if err := revisePidFile(context); err != nil {
 		return -1, err
 	}
+	/*加载配置文件并返回spec对象*/
 	spec, err := setupSpec(context)
 	if err != nil {
 		return -1, err
 	}
 
+	/*用户给定的container-id参数*/
 	id := context.Args().First()
 	if id == "" {
 		return -1, errEmptyID
 	}
 
+	/*构造notifySocket对象*/
 	notifySocket := newNotifySocket(context, os.Getenv("NOTIFY_SOCKET"), id)
 	if notifySocket != nil {
 		notifySocket.setupSpec(spec)
 	}
 
+	/*针对$id,创建container对象*/
 	container, err := createContainer(context, id, spec)
 	if err != nil {
 		return -1, err
 	}
 
 	if notifySocket != nil {
+		/*创建notifySocket对应的目录*/
 		if err := notifySocket.setupSocketDirectory(); err != nil {
 			return -1, err
 		}
 		if action == CT_ACT_RUN {
+			/*完成notifySocket监听*/
 			if err := notifySocket.bindSocket(); err != nil {
 				return -1, err
 			}

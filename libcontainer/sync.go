@@ -95,6 +95,7 @@ func readSync(pipe io.Reader, expected syncType) error {
 // parseSync runs the given callback function on each syncT received from the
 // child. It will return once io.EOF is returned from the given pipe.
 func parseSync(pipe io.Reader, fn func(*syncT) error) error {
+	/*自pipe中提取内容*/
 	dec := json.NewDecoder(pipe)
 	for {
 		var sync syncT

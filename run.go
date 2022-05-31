@@ -66,9 +66,11 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 		},
 	},
 	Action: func(context *cli.Context) error {
+		/*只容许一个参数*/
 		if err := checkArgs(context, 1, exactArgs); err != nil {
 			return err
 		}
+		/*对container执行run操作*/
 		status, err := startContainer(context, CT_ACT_RUN, nil)
 		if err == nil {
 			// exit with the container's exit status so any external supervisor is

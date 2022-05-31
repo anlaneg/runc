@@ -11,6 +11,7 @@ import (
 	"github.com/urfave/cli"
 )
 
+/*创建示例用spec文件*/
 var specCommand = cli.Command{
 	Name:      "spec",
 	Usage:     "create a new specification file",
@@ -75,9 +76,11 @@ created by an unprivileged user.
 		},
 	},
 	Action: func(context *cli.Context) error {
+		/*不接收参数*/
 		if err := checkArgs(context, 0, exactArgs); err != nil {
 			return err
 		}
+		/*生成一个示例用spec对象*/
 		spec := specconv.Example()
 
 		rootless := context.Bool("rootless")
@@ -88,44 +91,60 @@ created by an unprivileged user.
 		checkNoFile := func(name string) error {
 			_, err := os.Stat(name)
 			if err == nil {
+				/*文件已存在，报错*/
 				return fmt.Errorf("File %s exists. Remove it first", name)
 			}
 			if !os.IsNotExist(err) {
+				/*遇到其它io错误，报错*/
 				return err
 			}
 			return nil
 		}
+		
 		bundle := context.String("bundle")
 		if bundle != "" {
+			/*指明了bundle，切换工作目录到bundle*/
 			if err := os.Chdir(bundle); err != nil {
 				return err
 			}
 		}
+		
+		/*确认specConfig不存在*/
 		if err := checkNoFile(specConfig); err != nil {
 			return err
 		}
+		
+		/*将spec对象格式化为json串*/
 		data, err := json.MarshalIndent(spec, "", "\t")
 		if err != nil {
 			return err
 		}
+		
+		/*将json串写入specConfig中*/
 		return os.WriteFile(specConfig, data, 0o666)
 	},
 }
 
 // loadSpec loads the specification from the provided path.
 func loadSpec(cPath string) (spec *specs.Spec, err error) {
+	/*打开spec配置文件*/
 	cf, err := os.Open(cPath)
 	if err != nil {
+		/*文件不存在，报错*/
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("JSON specification file %s not found", cPath)
 		}
+		/*其它错误*/
 		return nil, err
 	}
 	defer cf.Close()
 
+	/*将json格式解码为spec对象*/
 	if err = json.NewDecoder(cf).Decode(&spec); err != nil {
 		return nil, err
 	}
+	
+	/*返回配置的spec对象*/
 	return spec, validateProcessSpec(spec.Process)
 }
 

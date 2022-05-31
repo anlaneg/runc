@@ -447,6 +447,7 @@ func setupNetwork(config *initConfig) error {
 		if err != nil {
 			return err
 		}
+		/*调用网络初始化*/
 		if err := strategy.initialize(config); err != nil {
 			return err
 		}

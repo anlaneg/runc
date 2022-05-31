@@ -38,9 +38,13 @@ const stdioFdCount = 3
 
 // Container is a libcontainer container object.
 type Container struct {
+	/*container名称*/
 	id                   string
+	/*container在host端地址，默认为/run/runc/$id*/
 	root                 string
+	/*container配置*/
 	config               *configs.Config
+	/*container cgroup manager对象*/
 	cgroupManager        cgroups.Manager
 	intelRdtManager      *intelrdt.Manager
 	initProcess          parentProcess
@@ -83,11 +87,13 @@ type State struct {
 
 // ID returns the container's unique ID
 func (c *Container) ID() string {
+	/*取container id*/
 	return c.id
 }
 
 // Config returns the container's configuration
 func (c *Container) Config() configs.Config {
+	/*取container 配置*/
 	return *c.config
 }
 
@@ -213,6 +219,7 @@ func (c *Container) Start(process *Process) error {
 			return err
 		}
 	}
+	/*调用.start*/
 	if err := c.start(process); err != nil {
 		if process.Init {
 			c.deleteExecFifo()
@@ -226,10 +233,12 @@ func (c *Container) Start(process *Process) error {
 // the process fails to start. It does not block waiting for the exec fifo
 // after start returns but opens the fifo after start returns.
 func (c *Container) Run(process *Process) error {
+	/*首先调用start*/
 	if err := c.Start(process); err != nil {
 		return err
 	}
 	if process.Init {
+		/*如果init为true,则调用c.exec*/
 		return c.exec()
 	}
 	return nil
@@ -434,20 +443,24 @@ func (c *Container) includeExecFifo(cmd *exec.Cmd) error {
 }
 
 func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
+	/*生成parent init文件，child init文件*/
 	parentInitPipe, childInitPipe, err := utils.NewSockPair("init")
 	if err != nil {
 		return nil, fmt.Errorf("unable to create init pipe: %w", err)
 	}
 	messageSockPair := filePair{parentInitPipe, childInitPipe}
 
+	/*生成parent log文件，child log文件*/
 	parentLogPipe, childLogPipe, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("unable to create log pipe: %w", err)
 	}
 	logFilePair := filePair{parentLogPipe, childLogPipe}
 
+	/*产生模板cmd*/
 	cmd := c.commandTemplate(p, childInitPipe, childLogPipe)
 	if !p.Init {
+		/*创建setns process*/
 		return c.newSetnsProcess(p, cmd, messageSockPair, logFilePair)
 	}
 
@@ -459,9 +472,12 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	if err := c.includeExecFifo(cmd); err != nil {
 		return nil, fmt.Errorf("unable to setup exec fifo: %w", err)
 	}
+	
+	/*创建init process*/
 	return c.newInitProcess(p, cmd, messageSockPair, logFilePair)
 }
 
+/*构造产生模板cmd*/
 func (c *Container) commandTemplate(p *Process, childInitPipe *os.File, childLogPipe *os.File) *exec.Cmd {
 	cmd := exec.Command("/proc/self/exe", "init")
 	cmd.Args[0] = os.Args[0]
@@ -599,6 +615,8 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, messageSockPair, 
 	if err != nil {
 		return nil, err
 	}
+	
+	/*构造setnsProcess对象*/
 	proc := &setnsProcess{
 		cmd:             cmd,
 		cgroupPaths:     state.CgroupPaths,

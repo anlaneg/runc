@@ -39,6 +39,7 @@ func NewUnifiedManager(config *configs.Cgroup, path string) (cgroups.Manager, er
 		return nil, err
 	}
 
+	/*创建fsMgr对象*/
 	fsMgr, err := fs2.NewManager(config, m.path)
 	if err != nil {
 		return nil, err
@@ -395,6 +396,7 @@ func (m *unifiedManager) getSliceFull() (string, error) {
 
 func (m *unifiedManager) initPath() error {
 	if m.path != "" {
+		/*已初始化完成，直接返回*/
 		return nil
 	}
 
@@ -425,6 +427,7 @@ func (m *unifiedManager) GetPids() ([]int, error) {
 	return cgroups.GetPids(m.path)
 }
 
+/*通过m.path获取all pid*/
 func (m *unifiedManager) GetAllPids() ([]int, error) {
 	return cgroups.GetAllPids(m.path)
 }
@@ -463,6 +466,7 @@ func (m *unifiedManager) GetFreezerState() (configs.FreezerState, error) {
 	return m.fsMgr.GetFreezerState()
 }
 
+/*检查m.path是否存在*/
 func (m *unifiedManager) Exists() bool {
 	return cgroups.PathExists(m.path)
 }

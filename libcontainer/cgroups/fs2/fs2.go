@@ -27,6 +27,7 @@ type manager struct {
 // If dirPath is empty, it is automatically set using config.
 func NewManager(config *configs.Cgroup, dirPath string) (cgroups.Manager, error) {
 	if dirPath == "" {
+		/*如果dirPath为空，则取默认dirpath*/
 		var err error
 		dirPath, err = defaultDirPath(config)
 		if err != nil {
@@ -34,6 +35,7 @@ func NewManager(config *configs.Cgroup, dirPath string) (cgroups.Manager, error)
 		}
 	}
 
+	/*构造v2对应的manager*/
 	m := &manager{
 		config:  config,
 		dirPath: dirPath,

@@ -18,6 +18,7 @@ import (
 
 type check func(config *configs.Config) error
 
+/*检查config*/
 func Validate(config *configs.Config) error {
 	checks := []check{
 		cgroupsCheck,
@@ -30,11 +31,15 @@ func Validate(config *configs.Config) error {
 		intelrdtCheck,
 		rootlessEUIDCheck,
 	}
+	
+	/*遍历执行这组checks回调，如果遇到err,则直接返回*/
 	for _, c := range checks {
 		if err := c(config); err != nil {
 			return err
 		}
 	}
+	
+	/*遍历执行warns回调，如果遇到err,则进行告警*/
 	// Relaxed validation rules for backward compatibility
 	warns := []check{
 		mounts, // TODO (runc v1.x.x): make this an error instead of a warning

@@ -76,9 +76,12 @@ func (l *linuxStandardInit) Init() error {
 		}
 	}
 
+	/*启动network*/
 	if err := setupNetwork(l.config); err != nil {
 		return err
 	}
+	
+	/*启动route*/
 	if err := setupRoute(l.config.Config); err != nil {
 		return err
 	}
@@ -250,5 +253,6 @@ func (l *linuxStandardInit) Init() error {
 		return err
 	}
 
+	/*执行程序*/
 	return system.Exec(name, l.config.Args[0:], os.Environ())
 }

@@ -5,6 +5,7 @@ import "os"
 // Spec is the base configuration for the container.
 type Spec struct {
 	// Version of the Open Container Initiative Runtime Specification with which the bundle complies.
+	/*版本号*/
 	Version string `json:"ociVersion"`
 	// Process configures the container process.
 	Process *Process `json:"process,omitempty"`
@@ -100,6 +101,7 @@ type User struct {
 // Root contains information about the container's root filesystem on the host.
 type Root struct {
 	// Path is the absolute path to the container's root filesystem.
+	/*container根路径*/
 	Path string `json:"path"`
 	// Readonly makes the root filesystem for the container readonly before the process is executed.
 	Readonly bool `json:"readonly,omitempty"`

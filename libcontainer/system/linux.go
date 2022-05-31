@@ -40,6 +40,7 @@ func Execv(cmd string, args []string, env []string) error {
 	return Exec(name, args, env)
 }
 
+/*执行程序*/
 func Exec(cmd string, args []string, env []string) error {
 	for {
 		err := unix.Exec(cmd, args, env)

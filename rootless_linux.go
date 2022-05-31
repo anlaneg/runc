@@ -11,12 +11,15 @@ import (
 
 func shouldUseRootlessCgroupManager(context *cli.Context) (bool, error) {
 	if context != nil {
+		/*取rootless配置*/
 		b, err := parseBoolOrAuto(context.GlobalString("rootless"))
 		if err != nil {
+			/*转换出错，报错*/
 			return false, err
 		}
 		// nil b stands for "auto detect"
 		if b != nil {
+			/*转换成功，返回转换的值*/
 			return *b, nil
 		}
 	}
