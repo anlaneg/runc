@@ -52,6 +52,7 @@ your host. Providing the bundle directory using "-b" is optional. The default
 value for "bundle" is the current directory.`
 )
 
+/*runc命令入口*/
 func main() {
 	/*初始化命令行*/
 	app := cli.NewApp()
