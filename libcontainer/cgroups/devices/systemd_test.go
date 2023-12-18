@@ -2,11 +2,13 @@ package devices
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
+	"github.com/opencontainers/runc/internal/testutil"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	"github.com/opencontainers/runc/libcontainer/configs"
@@ -25,6 +27,8 @@ func TestPodSkipDevicesUpdate(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("Test requires root.")
 	}
+	// https://github.com/opencontainers/runc/issues/3743.
+	testutil.SkipOnCentOS(t, "Flaky (#3743)", 7)
 
 	podName := "system-runc_test_pod" + t.Name() + ".slice"
 	podConfig := &configs.Cgroup{
@@ -66,7 +70,7 @@ func TestPodSkipDevicesUpdate(t *testing.T) {
 
 	// Create a "container" within the "pod" cgroup.
 	// This is not a real container, just a process in the cgroup.
-	cmd := exec.Command("bash", "-c", "while true; do echo > /dev/null; done")
+	cmd := exec.Command("sleep", "infinity")
 	cmd.Env = append(os.Environ(), "LANG=C")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -122,6 +126,8 @@ func testSkipDevices(t *testing.T, skipDevices bool, expected []string) {
 	if os.Geteuid() != 0 {
 		t.Skip("Test requires root.")
 	}
+	// https://github.com/opencontainers/runc/issues/3743.
+	testutil.SkipOnCentOS(t, "Flaky (#3743)", 7)
 
 	podConfig := &configs.Cgroup{
 		Parent: "system.slice",
@@ -233,6 +239,32 @@ func TestSkipDevicesFalse(t *testing.T) {
 		"/dev/full: Operation not permitted",
 		"cat: /dev/null: Operation not permitted",
 	})
+}
+
+func testFindDeviceGroup() error {
+	const (
+		major = 136
+		group = "char-pts"
+	)
+	res, err := findDeviceGroup(devices.CharDevice, major)
+	if res != group || err != nil {
+		return fmt.Errorf("expected %v, nil, got %v, %w", group, res, err)
+	}
+	return nil
+}
+
+func TestFindDeviceGroup(t *testing.T) {
+	if err := testFindDeviceGroup(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkFindDeviceGroup(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		if err := testFindDeviceGroup(); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func newManager(t *testing.T, config *configs.Cgroup) (m cgroups.Manager) {

@@ -27,10 +27,14 @@
 #include <linux/netlink.h>
 #include <linux/types.h>
 
+#include "getenv.h"
+#include "ipc.h"
+#include "log.h"
 /* Get all of the CLONE_NEW* flags. */
 #include "namespace.h"
 
-extern char *escape_json_string(char *str);
+/* Get definitions for idmap sources */
+#include "idmap.h"
 
 /* Synchronisation values. */
 enum sync_t {
@@ -42,6 +46,10 @@ enum sync_t {
 	SYNC_CHILD_FINISH = 0x45,	/* The child or grandchild has finished. */
 	SYNC_MOUNTSOURCES_PLS = 0x46,	/* Tell parent to send mount sources by SCM_RIGHTS. */
 	SYNC_MOUNTSOURCES_ACK = 0x47,	/* All mount sources have been sent. */
+	SYNC_MOUNT_IDMAP_PLS = 0x48,	/* Tell parent to mount idmap sources. */
+	SYNC_MOUNT_IDMAP_ACK = 0x49,	/* All idmap mounts have been done. */
+	SYNC_TIMEOFFSETS_PLS = 0x50,	/* Request parent to write timens offsets. */
+	SYNC_TIMEOFFSETS_ACK = 0x51,	/* Timens offsets were written. */
 };
 
 #define STAGE_SETUP  -1
@@ -94,23 +102,15 @@ struct nlconfig_t {
 	/* Mount sources opened outside the container userns. */
 	char *mountsources;
 	size_t mountsources_len;
+
+	/* Idmap sources opened outside the container userns which will be id mapped. */
+	char *idmapsources;
+	size_t idmapsources_len;
+
+	/* Time NS offsets. */
+	char *timensoffset;
+	size_t timensoffset_len;
 };
-
-/*
- * Log levels are the same as in logrus.
- */
-#define PANIC   0
-#define FATAL   1
-#define ERROR   2
-#define WARNING 3
-#define INFO    4
-#define DEBUG   5
-#define TRACE   6
-
-static const char *level_str[] = { "panic", "fatal", "error", "warning", "info", "debug", "trace" };
-
-static int logfd = -1;
-static int loglevel = DEBUG;
 
 /*
  * List of netlink message types sent to us as part of bootstrapping the init.
@@ -127,6 +127,8 @@ static int loglevel = DEBUG;
 #define UIDMAPPATH_ATTR		27288
 #define GIDMAPPATH_ATTR		27289
 #define MOUNT_SOURCES_ATTR	27290
+#define IDMAP_SOURCES_ATTR	27291
+#define TIMENSOFFSET_ATTR	27292
 
 /*
  * Use the raw syscall for versions of glibc which don't include a function for
@@ -149,64 +151,8 @@ int setns(int fd, int nstype)
 }
 #endif
 
-static void write_log(int level, const char *format, ...)
-{
-	char *message = NULL, *stage = NULL, *json = NULL;
-	va_list args;
-	int ret;
-
-	if (logfd < 0 || level > loglevel)
-		goto out;
-
-	va_start(args, format);
-	ret = vasprintf(&message, format, args);
-	va_end(args);
-	if (ret < 0) {
-		message = NULL;
-		goto out;
-	}
-
-	message = escape_json_string(message);
-
-	if (current_stage == STAGE_SETUP)
-		stage = strdup("nsexec");
-	else
-		ret = asprintf(&stage, "nsexec-%d", current_stage);
-	if (ret < 0) {
-		stage = NULL;
-		goto out;
-	}
-
-	ret = asprintf(&json, "{\"level\":\"%s\", \"msg\": \"%s[%d]: %s\"}\n",
-		       level_str[level], stage, getpid(), message);
-	if (ret < 0) {
-		json = NULL;
-		goto out;
-	}
-
-	/* This logging is on a best-effort basis. In case of a short or failed
-	 * write there is nothing we can do, so just ignore write() errors.
-	 */
-	ssize_t __attribute__((unused)) __res = write(logfd, json, ret);
-
-out:
-	free(message);
-	free(stage);
-	free(json);
-}
-
 /* XXX: This is ugly. */
 static int syncfd = -1;
-
-#define bail(fmt, ...)                                               \
-	do {                                                         \
-		if (logfd < 0)                                       \
-			fprintf(stderr, "FATAL: " fmt ": %m\n",      \
-				##__VA_ARGS__);                      \
-		else                                                 \
-			write_log(FATAL, fmt ": %m", ##__VA_ARGS__); \
-		exit(1);                                             \
-	} while(0)
 
 static int write_file(char *data, size_t data_len, char *pathfmt, ...)
 {
@@ -395,58 +341,6 @@ static int clone_parent(jmp_buf *env, int jmpval)
 	return clone(child_func, ca.stack_ptr, CLONE_PARENT | SIGCHLD, &ca);
 }
 
-/*
- * Returns an environment variable value as a non-negative integer, or -ENOENT
- * if the variable was not found or has an empty value.
- *
- * If the value can not be converted to an integer, or the result is out of
- * range, the function bails out.
- */
-static int getenv_int(const char *name)
-{
-	char *val, *endptr;
-	int ret;
-
-	val = getenv(name);
-	/* Treat empty value as unset variable. */
-	if (val == NULL || *val == '\0')
-		return -ENOENT;
-
-	ret = strtol(val, &endptr, 10);
-	if (val == endptr || *endptr != '\0')
-		bail("unable to parse %s=%s", name, val);
-	/*
-	 * Sanity check: this must be a small non-negative number.
-	 * Practically, we pass two fds (3 and 4) and a log level,
-	 * for which the maximum is 6 (TRACE).
-	 * */
-	if (ret < 0 || ret > TRACE)
-		bail("bad value for %s=%s (%d)", name, val, ret);
-
-	return ret;
-}
-
-/*
- * Sets up logging by getting log fd and log level from the environment,
- * if available.
- */
-static void setup_logpipe(void)
-{
-	int i;
-
-	i = getenv_int("_LIBCONTAINER_LOGPIPE");
-	if (i < 0) {
-		/* We are not runc init, or log pipe was not provided. */
-		return;
-	}
-	logfd = i;
-
-	i = getenv_int("_LIBCONTAINER_LOGLEVEL");
-	if (i < 0)
-		return;
-	loglevel = i;
-}
-
 /* Returns the clone(2) flag for a namespace, given the name of a namespace. */
 static int nsflag(char *name)
 {
@@ -464,6 +358,8 @@ static int nsflag(char *name)
 		return CLONE_NEWUSER;
 	else if (!strcmp(name, "uts"))
 		return CLONE_NEWUTS;
+	else if (!strcmp(name, "time"))
+		return CLONE_NEWTIME;
 
 	/* If we don't recognise a name, fallback to 0. */
 	return 0;
@@ -554,6 +450,14 @@ static void nl_parse(int fd, struct nlconfig_t *config)
 			config->mountsources = current;
 			config->mountsources_len = payload_len;
 			break;
+		case IDMAP_SOURCES_ATTR:
+			config->idmapsources = current;
+			config->idmapsources_len = payload_len;
+			break;
+		case TIMENSOFFSET_ATTR:
+			config->timensoffset = current;
+			config->timensoffset_len = payload_len;
+			break;
 		default:
 			bail("unknown netlink message type %d", nlattr->nla_type);
 		}
@@ -634,9 +538,6 @@ void join_namespaces(char *nslist)
 	free(namespaces);
 }
 
-/* Defined in cloned_binary.c. */
-extern int ensure_cloned_binary(void);
-
 static inline int sane_kill(pid_t pid, int signum)
 {
 	if (pid > 0)
@@ -645,121 +546,30 @@ static inline int sane_kill(pid_t pid, int signum)
 		return 0;
 }
 
-void receive_fd(int sockfd, int new_fd)
+/* receive_fd_sources parses env_var as an array of fd numbers and, for each element that is
+ * not -1, it receives an fd via SCM_RIGHTS and dup3 it to the fd requested in
+ * the element of the env var.
+ */
+void receive_fd_sources(int sockfd, const char *env_var)
 {
-	int bytes_read;
-	struct msghdr msg = { };
-	struct cmsghdr *cmsg;
-	struct iovec iov = { };
-	char null_byte = '\0';
-	int ret;
-	int fd_count;
-	int *fd_payload;
-
-	iov.iov_base = &null_byte;
-	iov.iov_len = 1;
-
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-
-	msg.msg_controllen = CMSG_SPACE(sizeof(int));
-	msg.msg_control = malloc(msg.msg_controllen);
-	if (msg.msg_control == NULL) {
-		bail("Can't allocate memory to receive fd.");
-	}
-
-	memset(msg.msg_control, 0, msg.msg_controllen);
-
-	bytes_read = recvmsg(sockfd, &msg, 0);
-	if (bytes_read != 1)
-		bail("failed to receive fd from unix socket %d", sockfd);
-	if (msg.msg_flags & MSG_CTRUNC)
-		bail("received truncated control message from unix socket %d", sockfd);
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	if (!cmsg)
-		bail("received message from unix socket %d without control message", sockfd);
-
-	if (cmsg->cmsg_level != SOL_SOCKET)
-		bail("received unknown control message from unix socket %d: cmsg_level=%d", sockfd, cmsg->cmsg_level);
-
-	if (cmsg->cmsg_type != SCM_RIGHTS)
-		bail("received unknown control message from unix socket %d: cmsg_type=%d", sockfd, cmsg->cmsg_type);
-
-	fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-	if (fd_count != 1)
-		bail("received control message from unix socket %d with too many fds: %d", sockfd, fd_count);
-
-	fd_payload = (int *)CMSG_DATA(cmsg);
-	ret = dup3(*fd_payload, new_fd, O_CLOEXEC);
-	if (ret < 0)
-		bail("cannot dup3 fd %d to %d", *fd_payload, new_fd);
-
-	free(msg.msg_control);
-
-	ret = close(*fd_payload);
-	if (ret < 0)
-		bail("cannot close fd %d", *fd_payload);
-}
-
-void send_fd(int sockfd, int fd)
-{
-	int bytes_written;
-	struct msghdr msg = { };
-	struct cmsghdr *cmsg;
-	struct iovec iov[1] = { };
-	char null_byte = '\0';
-
-	iov[0].iov_base = &null_byte;
-	iov[0].iov_len = 1;
-
-	msg.msg_iov = iov;
-	msg.msg_iovlen = 1;
-
-	/* We send only one fd as specified by cmsg->cmsg_len below, even
-	 * though msg.msg_controllen might have more space due to alignment. */
-	msg.msg_controllen = CMSG_SPACE(sizeof(int));
-	msg.msg_control = malloc(msg.msg_controllen);
-	if (msg.msg_control == NULL) {
-		bail("Can't allocate memory to send fd.");
-	}
-
-	memset(msg.msg_control, 0, msg.msg_controllen);
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = SCM_RIGHTS;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-	bytes_written = sendmsg(sockfd, &msg, 0);
-
-	free(msg.msg_control);
-
-	if (bytes_written != 1)
-		bail("failed to send fd %d via unix socket %d", fd, sockfd);
-}
-
-void receive_mountsources(int sockfd)
-{
-	char *mount_fds, *endp;
+	char *fds, *endp;
 	long new_fd;
 
 	// This env var must be a json array of ints.
-	mount_fds = getenv("_LIBCONTAINER_MOUNT_FDS");
+	fds = getenv(env_var);
 
-	if (mount_fds[0] != '[') {
-		bail("malformed _LIBCONTAINER_MOUNT_FDS env var: missing '['");
+	if (fds[0] != '[') {
+		bail("malformed %s env var: missing '['", env_var);
 	}
-	mount_fds++;
+	fds++;
 
-	for (endp = mount_fds; *endp != ']'; mount_fds = endp + 1) {
-		new_fd = strtol(mount_fds, &endp, 10);
-		if (endp == mount_fds) {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: not a number");
+	for (endp = fds; *endp != ']'; fds = endp + 1) {
+		new_fd = strtol(fds, &endp, 10);
+		if (endp == fds) {
+			bail("malformed %s env var: not a number", env_var);
 		}
 		if (*endp == '\0') {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: missing ]");
+			bail("malformed %s env var: missing ]", env_var);
 		}
 		// The list contains -1 when no fd is needed. Ignore them.
 		if (new_fd == -1) {
@@ -767,11 +577,22 @@ void receive_mountsources(int sockfd)
 		}
 
 		if (new_fd == LONG_MAX || new_fd < 0 || new_fd > INT_MAX) {
-			bail("malformed _LIBCONTAINER_MOUNT_FDS env var: fds out of range");
+			bail("malformed %s env var: fds out of range", env_var);
 		}
 
-		receive_fd(sockfd, new_fd);
+		int recv_fd = receive_fd(sockfd);
+		if (dup3(recv_fd, new_fd, O_CLOEXEC) < 0) {
+			bail("cannot dup3 fd %d to %ld", recv_fd, new_fd);
+		}
+		if (close(recv_fd) < 0) {
+			bail("cannot close fd %d", recv_fd);
+		}
 	}
+}
+
+void receive_mountsources(int sockfd)
+{
+	receive_fd_sources(sockfd, "_LIBCONTAINER_MOUNT_FDS");
 }
 
 void send_mountsources(int sockfd, pid_t child, char *mountsources, size_t mountsources_len)
@@ -812,7 +633,9 @@ void send_mountsources(int sockfd, pid_t child, char *mountsources, size_t mount
 		if (fd < 0)
 			bail("failed to open mount source %s", mountsources);
 
-		send_fd(sockfd, fd);
+		write_log(DEBUG, "~> sending fd for: %s", mountsources);
+		if (send_fd(sockfd, fd) < 0)
+			bail("failed to send fd %d via unix socket %d", fd, sockfd);
 
 		ret = close(fd);
 		if (ret != 0)
@@ -830,6 +653,117 @@ void send_mountsources(int sockfd, pid_t child, char *mountsources, size_t mount
 	ret = close(container_mntns_fd);
 	if (ret != 0)
 		bail("failed to close container mount namespace fd %d", container_mntns_fd);
+}
+
+void try_unshare(int flags, const char *msg)
+{
+	write_log(DEBUG, "unshare %s", msg);
+	/*
+	 * Kernels prior to v4.3 may return EINVAL on unshare when another process
+	 * reads runc's /proc/$PID/status or /proc/$PID/maps. To work around this,
+	 * retry on EINVAL a few times.
+	 */
+	int retries = 5;
+	for (; retries > 0; retries--) {
+		if (unshare(flags) == 0) {
+			return;
+		}
+		if (errno != EINVAL)
+			break;
+	}
+	bail("failed to unshare %s", msg);
+}
+
+void send_idmapsources(int sockfd, pid_t pid, char *idmap_src, int idmap_src_len)
+{
+	char proc_user_path[PATH_MAX];
+
+	/* Open the userns fd only once.
+	 * Currently we only support idmap mounts that use the same mapping than
+	 * the userns. This is validated in libcontainer/configs/validate/validator.go,
+	 * so if we reached here, we know the mapping for the idmap is the same
+	 * as the userns. This is why we just open the userns_fd once from the
+	 * PID of the child process that has the userns already applied.
+	 */
+	int ret = snprintf(proc_user_path, sizeof(proc_user_path), "/proc/%d/ns/user", pid);
+	if (ret < 0 || (size_t)ret >= sizeof(proc_user_path)) {
+		sane_kill(pid, SIGKILL);
+		bail("failed to create userns path string");
+	}
+
+	int userns_fd = open(proc_user_path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+	if (userns_fd < 0) {
+		sane_kill(pid, SIGKILL);
+		bail("failed to get user namespace fd");
+	}
+
+	char *idmap_end = idmap_src + idmap_src_len;
+	while (idmap_src < idmap_end) {
+		if (idmap_src[0] == '\0') {
+			idmap_src++;
+			continue;
+		}
+
+		int fd_tree = sys_open_tree(-EBADF, idmap_src,
+					    OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC |
+					    AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT);
+		if (fd_tree < 0) {
+			sane_kill(pid, SIGKILL);
+			if (errno == ENOSYS) {
+				bail("open_tree(2) failed, the kernel doesn't support ID-mapped mounts");
+			} else if (errno == EINVAL) {
+				bail("open_tree(2) failed with path: %s, the kernel doesn't support ID-mapped mounts",
+				     idmap_src);
+			} else {
+				bail("open_tree(2) failed with path: %s", idmap_src);
+			}
+		}
+
+		struct mount_attr attr = {
+			.attr_set = MOUNT_ATTR_IDMAP,
+			.userns_fd = userns_fd,
+		};
+
+		ret = sys_mount_setattr(fd_tree, "", AT_EMPTY_PATH, &attr, sizeof(attr));
+		if (ret < 0) {
+			sane_kill(pid, SIGKILL);
+			if (errno == ENOSYS)
+				bail("mount_setattr(2) failed, the kernel doesn't support ID-mapped mounts");
+			else if (errno == EINVAL)
+				bail("mount_setattr(2) failed with path: %s, maybe the filesystem doesn't support ID-mapped mounts", idmap_src);
+			else
+				bail("mount_setattr(2) failed with path: %s", idmap_src);
+		}
+
+		write_log(DEBUG, "~> sending idmap source: %s with mapping from: %s", idmap_src, proc_user_path);
+		send_fd(sockfd, fd_tree);
+
+		if (close(fd_tree) < 0) {
+			sane_kill(pid, SIGKILL);
+			bail("error closing fd_tree");
+		}
+
+		idmap_src += strlen(idmap_src) + 1;
+	}
+
+	if (close(userns_fd) < 0) {
+		sane_kill(pid, SIGKILL);
+		bail("error closing userns fd");
+	}
+}
+
+void receive_idmapsources(int sockfd)
+{
+	receive_fd_sources(sockfd, "_LIBCONTAINER_IDMAP_FDS");
+}
+
+static void update_timens_offsets(pid_t pid, char *map, size_t map_len)
+{
+	if (map == NULL || map_len == 0)
+		return;
+	write_log(DEBUG, "update /proc/%d/timens_offsets to '%s'", pid, map);
+	if (write_file(map, map_len, "/proc/%d/timens_offsets", pid) < 0)
+		bail("failed to update /proc/%d/timens_offsets", pid);
 }
 
 void nsexec(void)
@@ -855,14 +789,6 @@ void nsexec(void)
 		/* We are not a runc init. Just return to go runtime. */
 		return;
 	}
-
-	/*
-	 * We need to re-exec if we are not in a cloned binary. This is necessary
-	 * to ensure that containers won't be able to access the host binary
-	 * through /proc/self/exe. See CVE-2019-5736.
-	 */
-	if (ensure_cloned_binary() < 0)
-		bail("could not ensure we are a cloned binary");
 
 	/*
 	 * Inform the parent we're past initial setup.
@@ -960,8 +886,7 @@ void nsexec(void)
 	 * -- Aleksa "what has my life come to?" Sarai
 	 */
 
-	current_stage = setjmp(env);
-	switch (current_stage) {
+	switch (setjmp(env)) {
 		/*
 		 * Stage 0: We're in the parent. Our job is just to create a new child
 		 *          (stage 1: STAGE_CHILD) process and write its uid_map and
@@ -975,6 +900,7 @@ void nsexec(void)
 			bool stage1_complete, stage2_complete;
 
 			/* For debugging. */
+			current_stage = STAGE_PARENT;
 			prctl(PR_SET_NAME, (unsigned long)"runc:[0:PARENT]", 0, 0, 0);
 			write_log(DEBUG, "~> nsexec stage-0");
 
@@ -1034,7 +960,6 @@ void nsexec(void)
 					/* Get the stage-2 pid. */
 					if (read(syncfd, &stage2_pid, sizeof(stage2_pid)) != sizeof(stage2_pid)) {
 						sane_kill(stage1_pid, SIGKILL);
-						sane_kill(stage2_pid, SIGKILL);
 						bail("failed to sync with stage-1: read(stage2_pid)");
 					}
 
@@ -1065,13 +990,34 @@ void nsexec(void)
 					}
 					break;
 				case SYNC_MOUNTSOURCES_PLS:
+					write_log(DEBUG, "stage-1 requested to open mount sources");
 					send_mountsources(syncfd, stage1_pid, config.mountsources,
 							  config.mountsources_len);
 
 					s = SYNC_MOUNTSOURCES_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
-						kill(stage1_pid, SIGKILL);
+						sane_kill(stage1_pid, SIGKILL);
 						bail("failed to sync with child: write(SYNC_MOUNTSOURCES_ACK)");
+					}
+					break;
+				case SYNC_MOUNT_IDMAP_PLS:
+					write_log(DEBUG, "stage-1 requested to open idmap sources");
+					send_idmapsources(syncfd, stage1_pid, config.idmapsources,
+							  config.idmapsources_len);
+					s = SYNC_MOUNT_IDMAP_ACK;
+					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+						sane_kill(stage1_pid, SIGKILL);
+						bail("failed to sync with child: write(SYNC_MOUNT_IDMAP_ACK)");
+					}
+
+					break;
+				case SYNC_TIMEOFFSETS_PLS:
+					write_log(DEBUG, "stage-1 requested timens offsets to be configured");
+					update_timens_offsets(stage1_pid, config.timensoffset, config.timensoffset_len);
+					s = SYNC_TIMEOFFSETS_ACK;
+					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+						sane_kill(stage1_pid, SIGKILL);
+						bail("failed to sync with child: write(SYNC_TIMEOFFSETS_ACK)");
 					}
 					break;
 				case SYNC_CHILD_FINISH:
@@ -1132,6 +1078,9 @@ void nsexec(void)
 			pid_t stage2_pid = -1;
 			enum sync_t s;
 
+			/* For debugging. */
+			current_stage = STAGE_CHILD;
+
 			/* We're in a child and thus need to tell the parent if we die. */
 			syncfd = sync_child_pipe[0];
 			if (close(sync_child_pipe[1]) < 0)
@@ -1170,9 +1119,7 @@ void nsexec(void)
 			 * problem.
 			 */
 			if (config.cloneflags & CLONE_NEWUSER) {
-				write_log(DEBUG, "unshare user namespace");
-				if (unshare(CLONE_NEWUSER) < 0)
-					bail("failed to unshare user namespace");
+				try_unshare(CLONE_NEWUSER, "user namespace");
 				config.cloneflags &= ~CLONE_NEWUSER;
 
 				/*
@@ -1224,30 +1171,51 @@ void nsexec(void)
 			 * some old kernel versions where clone(CLONE_PARENT | CLONE_NEWPID)
 			 * was broken, so we'll just do it the long way anyway.
 			 */
-			write_log(DEBUG, "unshare remaining namespace (except cgroupns)");
-			if (unshare(config.cloneflags & ~CLONE_NEWCGROUP) < 0)
-				bail("failed to unshare remaining namespaces (except cgroupns)");
+			try_unshare(config.cloneflags, "remaining namespaces");
+
+			if (config.timensoffset) {
+				write_log(DEBUG, "request stage-0 to write timens offsets");
+
+				s = SYNC_TIMEOFFSETS_PLS;
+				if (write(syncfd, &s, sizeof(s)) != sizeof(s))
+					bail("failed to sync with parent: write(SYNC_TIMEOFFSETS_PLS)");
+
+				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
+					bail("failed to sync with parent: read(SYNC_TIMEOFFSETS_ACK)");
+				if (s != SYNC_TIMEOFFSETS_ACK)
+					bail("failed to sync with parent: SYNC_TIMEOFFSETS_ACK: got %u", s);
+			}
 
 			/* Ask our parent to send the mount sources fds. */
 			if (config.mountsources) {
+				write_log(DEBUG, "request stage-0 to send mount sources");
 				s = SYNC_MOUNTSOURCES_PLS;
-				if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
-					kill(stage2_pid, SIGKILL);
+				if (write(syncfd, &s, sizeof(s)) != sizeof(s))
 					bail("failed to sync with parent: write(SYNC_MOUNTSOURCES_PLS)");
-				}
 
 				/* Receive and install all mount sources fds. */
 				receive_mountsources(syncfd);
 
 				/* Parent finished to send the mount sources fds. */
-				if (read(syncfd, &s, sizeof(s)) != sizeof(s)) {
-					kill(stage2_pid, SIGKILL);
+				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
 					bail("failed to sync with parent: read(SYNC_MOUNTSOURCES_ACK)");
-				}
-				if (s != SYNC_MOUNTSOURCES_ACK) {
-					kill(stage2_pid, SIGKILL);
+				if (s != SYNC_MOUNTSOURCES_ACK)
 					bail("failed to sync with parent: SYNC_MOUNTSOURCES_ACK: got %u", s);
-				}
+			}
+
+			if (config.idmapsources) {
+				write_log(DEBUG, "request stage-0 to send idmap sources");
+				s = SYNC_MOUNT_IDMAP_PLS;
+				if (write(syncfd, &s, sizeof(s)) != sizeof(s))
+					bail("failed to sync with parent: write(SYNC_MOUNT_IDMAP_PLS)");
+
+				/* Receive and install all idmap fds. */
+				receive_idmapsources(syncfd);
+
+				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
+					bail("failed to sync with parent: read(SYNC_MOUNT_IDMAP_ACK)");
+				if (s != SYNC_MOUNT_IDMAP_ACK)
+					bail("failed to sync with parent: SYNC_MOUNT_IDMAP_ACK: got %u", s);
 			}
 
 			/*
@@ -1312,6 +1280,9 @@ void nsexec(void)
 			 */
 			enum sync_t s;
 
+			/* For debugging. */
+			current_stage = STAGE_INIT;
+
 			/* We're in a child and thus need to tell the parent if we die. */
 			syncfd = sync_grandchild_pipe[0];
 			if (close(sync_grandchild_pipe[1]) < 0)
@@ -1343,11 +1314,6 @@ void nsexec(void)
 					bail("setgroups failed");
 			}
 
-			if (config.cloneflags & CLONE_NEWCGROUP) {
-				if (unshare(CLONE_NEWCGROUP) < 0)
-					bail("failed to unshare cgroup namespace");
-			}
-
 			write_log(DEBUG, "signal completion to stage-0");
 			s = SYNC_CHILD_FINISH;
 			if (write(syncfd, &s, sizeof(s)) != sizeof(s))
@@ -1367,7 +1333,7 @@ void nsexec(void)
 		}
 		break;
 	default:
-		bail("unknown stage '%d' for jump value", current_stage);
+		bail("unexpected jump value");
 	}
 
 	/* Should never be reached. */

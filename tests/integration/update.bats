@@ -99,8 +99,8 @@ function setup() {
 		# try to remove memory swap limit
 		runc update test_update --memory-swap -1
 		[ "$status" -eq 0 ]
-		check_cgroup_value "$MEM_SWAP" $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 
 		# update memory swap
 		if [ -v CGROUP_V2 ]; then
@@ -123,13 +123,13 @@ function setup() {
 	[ "$status" -eq 0 ]
 
 	# check memory limit is gone
-	check_cgroup_value $MEM_LIMIT $SYSTEM_MEM
-	check_systemd_value $SD_MEM_LIMIT $SD_UNLIMITED
+	check_cgroup_value "$MEM_LIMIT" "$SYSTEM_MEM"
+	check_systemd_value "$SD_MEM_LIMIT" "$SD_UNLIMITED"
 
 	# check swap memory limited is gone
 	if [ "$HAVE_SWAP" = "yes" ]; then
-		check_cgroup_value $MEM_SWAP $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 	fi
 
 	# update pids limit
@@ -332,6 +332,23 @@ EOF
 	check_cpu_shares 100
 }
 
+@test "cpu burst" {
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+	requires cgroups_cpu_burst
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+	check_cpu_burst 0
+
+	runc update test_update --cpu-period 900000 --cpu-burst 500000
+	[ "$status" -eq 0 ]
+	check_cpu_burst 500000
+
+	runc update test_update --cpu-period 900000 --cpu-burst 0
+	[ "$status" -eq 0 ]
+	check_cpu_burst 0
+}
+
 @test "set cpu period with no quota" {
 	[ $EUID -ne 0 ] && requires rootless_cgroup
 
@@ -423,6 +440,96 @@ EOF
 	runc update --cpu-period 10000 --cpu-quota 3000 test_update
 	[ "$status" -eq 0 ]
 	check_cpu_quota 3000 10000 "300ms"
+}
+
+@test "update cgroup cpu.idle" {
+	requires cgroups_cpu_idle
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+
+	check_cgroup_value "cpu.idle" "0"
+
+	local val
+	for val in 1 0 1; do
+		runc update -r - test_update <<EOF
+{
+  "cpu": {
+    "idle": $val
+  }
+}
+EOF
+		[ "$status" -eq 0 ]
+		check_cgroup_value "cpu.idle" "$val"
+	done
+
+	for val in 1 0 1; do
+		runc update --cpu-idle "$val" test_update
+
+		[ "$status" -eq 0 ]
+		check_cgroup_value "cpu.idle" "$val"
+	done
+
+	# Values other than 1 or 0 are ignored by the kernel, see
+	# sched_group_set_idle() in kernel/sched/fair.c.
+	#
+	# If this ever fails, it means that the kernel now accepts values
+	# other than 0 or 1, and runc needs to adopt.
+	for val in -1 2 3; do
+		runc update --cpu-idle "$val" test_update
+		[ "$status" -ne 0 ]
+		check_cgroup_value "cpu.idle" "1"
+	done
+
+	# https://github.com/opencontainers/runc/issues/3786
+	[ "$(systemd_version)" -ge 252 ] && return
+	# test update other option won't impact on cpu.idle
+	runc update --cpu-period 10000 test_update
+	[ "$status" -eq 0 ]
+	check_cgroup_value "cpu.idle" "1"
+}
+
+@test "update cgroup cpu.idle via systemd v252+" {
+	requires cgroups_v2 systemd_v252 cgroups_cpu_idle
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+	check_cgroup_value "cpu.idle" "0"
+
+	# If cpu-idle is set, cpu-share (converted to CPUWeight) can't be set via systemd.
+	runc update --cpu-share 200 --cpu-idle 1 test_update
+	[[ "$output" == *"unable to apply both"* ]]
+	check_cgroup_value "cpu.idle" "1"
+
+	# Changing cpu-shares (converted to CPU weight) resets cpu.idle to 0.
+	runc update --cpu-share 200 test_update
+	check_cgroup_value "cpu.idle" "0"
+
+	# Setting values via unified map.
+
+	# If cpu.idle is set, cpu.weight is ignored.
+	runc update -r - test_update <<EOF
+{
+  "unified": {
+    "cpu.idle": "1",
+    "cpu.weight": "8"
+  }
+}
+EOF
+	[[ "$output" == *"unable to apply both"* ]]
+	check_cgroup_value "cpu.idle" "1"
+
+	# Setting any cpu.weight should reset cpu.idle to 0.
+	runc update -r - test_update <<EOF
+{
+  "unified": {
+    "cpu.weight": "8"
+  }
+}
+EOF
+	check_cgroup_value "cpu.idle" "0"
 }
 
 @test "update cgroup v2 resources via unified map" {
@@ -557,6 +664,33 @@ EOF
 	check_systemd_value "AllowedMemoryNodes" 1
 }
 
+@test "update cpuset cpus range via v2 unified map" {
+	# This test assumes systemd >= v244
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+	requires systemd cgroups_v2 more_than_8_core cgroups_cpuset
+
+	update_config ' .linux.resources.unified |= {
+				"cpuset.cpus": "0-5",
+			}'
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+
+	# check that the initial value was properly set
+	check_systemd_value "AllowedCPUs" "0-5"
+
+	runc update -r - test_update <<EOF
+{
+  "unified": {
+    "cpuset.cpus": "5-8"
+  }
+}
+EOF
+	[ "$status" -eq 0 ]
+
+	# check the updated systemd unit property, the value should not be affected by byte order
+	check_systemd_value "AllowedCPUs" "5-8"
+}
+
 @test "update rt period and runtime" {
 	[ $EUID -ne 0 ] && requires rootless_cgroup
 	requires cgroups_v1 cgroups_rt no_systemd
@@ -642,7 +776,6 @@ EOF
 			| .linux.devices = [{"path": "/dev/kmsg", "type": "c", "major": 1, "minor": 11}]
 			| .process.capabilities.bounding += ["CAP_SYSLOG"]
 			| .process.capabilities.effective += ["CAP_SYSLOG"]
-			| .process.capabilities.inheritable += ["CAP_SYSLOG"]
 			| .process.capabilities.permitted += ["CAP_SYSLOG"]
 			| .process.args |= ["sh", "-c", "while true; do head -c 100 /dev/kmsg 2> /dev/null; done"]'
 
@@ -699,4 +832,44 @@ EOF
 	# Resume the container.
 	runc resume test_update
 	[ "$status" -eq 0 ]
+}
+
+@test "update memory vs CheckBeforeUpdate" {
+	requires cgroups_v2
+	[ $EUID -ne 0 ] && requires rootless_cgroup
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
+	[ "$status" -eq 0 ]
+
+	# Setting memory to low value with checkBeforeUpdate=true should fail.
+	runc update -r - test_update <<EOF
+{
+  "memory": {
+    "limit": 1024,
+    "checkBeforeUpdate": true
+  }
+}
+EOF
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"rejecting memory limit"* ]]
+	testcontainer test_update running
+
+	# Setting memory+swap to low value with checkBeforeUpdate=true should fail.
+	runc update -r - test_update <<EOF
+{
+  "memory": {
+    "limit": 1024,
+    "swap": 2048,
+    "checkBeforeUpdate": true
+  }
+}
+EOF
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"rejecting memory+swap limit"* ]]
+	testcontainer test_update running
+
+	# The container will be OOM killed, and runc might either succeed
+	# or fail depending on the timing, so we don't check its exit code.
+	runc update test_update --memory 1024
+	wait_for_container 10 1 test_update stopped
 }

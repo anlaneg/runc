@@ -20,12 +20,14 @@ import (
 )
 
 type linuxStandardInit struct {
-	pipe          *os.File
+	pipe          *syncSocket
 	consoleSocket *os.File
+	pidfdSocket   *os.File
 	parentPid     int
 	fifoFd        int
 	logFd         int
-	mountFds      []int
+	dmzExe        *os.File
+	mountFds      mountFds
 	config        *initConfig
 }
 
@@ -89,15 +91,14 @@ func (l *linuxStandardInit) Init() error {
 	// initialises the labeling system
 	selinux.GetEnabled()
 
-	// We don't need the mountFds after prepareRootfs() nor if it fails.
+	// We don't need the mount nor idmap fds after prepareRootfs() nor if it fails.
 	err := prepareRootfs(l.pipe, l.config, l.mountFds)
-	for _, m := range l.mountFds {
+	for _, m := range append(l.mountFds.sourceFds, l.mountFds.idmapFds...) {
 		if m == -1 {
 			continue
 		}
-
 		if err := unix.Close(m); err != nil {
-			return fmt.Errorf("Unable to close mountFds fds: %w", err)
+			return fmt.Errorf("unable to close mountFds fds: %w", err)
 		}
 	}
 
@@ -117,6 +118,12 @@ func (l *linuxStandardInit) Init() error {
 		}
 	}
 
+	if l.pidfdSocket != nil {
+		if err := setupPidfd(l.pidfdSocket, "standard"); err != nil {
+			return fmt.Errorf("failed to setup pidfd: %w", err)
+		}
+	}
+
 	// Finish the rootfs setup.
 	if l.config.Config.Namespaces.Contains(configs.NEWNS) {
 		if err := finalizeRootfs(l.config.Config); err != nil {
@@ -127,6 +134,11 @@ func (l *linuxStandardInit) Init() error {
 	if hostname := l.config.Config.Hostname; hostname != "" {
 		if err := unix.Sethostname([]byte(hostname)); err != nil {
 			return &os.SyscallError{Syscall: "sethostname", Err: err}
+		}
+	}
+	if domainname := l.config.Config.Domainname; domainname != "" {
+		if err := unix.Setdomainname([]byte(domainname)); err != nil {
+			return &os.SyscallError{Syscall: "setdomainname", Err: err}
 		}
 	}
 	if err := apparmor.ApplyProfile(l.config.AppArmorProfile); err != nil {
@@ -157,6 +169,13 @@ func (l *linuxStandardInit) Init() error {
 			return &os.SyscallError{Syscall: "prctl(SET_NO_NEW_PRIVS)", Err: err}
 		}
 	}
+
+	if l.config.Config.Scheduler != nil {
+		if err := setupScheduler(l.config.Config); err != nil {
+			return err
+		}
+	}
+
 	// Tell our parent that we're ready to Execv. This must be done before the
 	// Seccomp rules have been applied, because we need to be able to read and
 	// write to a socket.
@@ -201,6 +220,14 @@ func (l *linuxStandardInit) Init() error {
 	if err != nil {
 		return err
 	}
+	// exec.LookPath in Go < 1.20 might return no error for an executable
+	// residing on a file system mounted with noexec flag, so perform this
+	// extra check now while we can still return a proper error.
+	// TODO: remove this once go < 1.20 is not supported.
+	if err := eaccess(name); err != nil {
+		return &os.PathError{Op: "eaccess", Path: name, Err: err}
+	}
+
 	// Set seccomp as close to execve as possible, so as few syscalls take
 	// place afterward (reducing the amount of syscalls that users need to
 	// enable in their seccomp profiles). However, this needs to be done
@@ -216,11 +243,20 @@ func (l *linuxStandardInit) Init() error {
 			return err
 		}
 	}
+
+	// Set personality if specified.
+	if l.config.Config.Personality != nil {
+		if err := setupPersonality(l.config.Config); err != nil {
+			return err
+		}
+	}
+
 	// Close the pipe to signal that we have completed our init.
 	logrus.Debugf("init: closing the pipe to signal completion")
 	_ = l.pipe.Close()
 
 	// Close the log pipe fd so the parent's ForwardLogs can exit.
+	logrus.Debugf("init: about to wait on exec fifo")
 	if err := unix.Close(l.logFd); err != nil {
 		return &os.PathError{Op: "close log pipe", Path: "fd " + strconv.Itoa(l.logFd), Err: err}
 	}
@@ -249,10 +285,14 @@ func (l *linuxStandardInit) Init() error {
 	s := l.config.SpecState
 	s.Pid = unix.Getpid()
 	s.Status = specs.StateCreated
-	if err := l.config.Config.Hooks[configs.StartContainer].RunHooks(s); err != nil {
+	if err := l.config.Config.Hooks.Run(configs.StartContainer, s); err != nil {
 		return err
 	}
 
+	if l.dmzExe != nil {
+		l.config.Args[0] = name
+		return system.Fexecve(l.dmzExe.Fd(), l.config.Args, os.Environ())
+	}
 	/*执行程序*/
-	return system.Exec(name, l.config.Args[0:], os.Environ())
+	return system.Exec(name, l.config.Args, os.Environ())
 }

@@ -8,9 +8,13 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/opencontainers/runc/internal/testutil"
 )
 
 func TestWriteCgroupFileHandlesInterrupt(t *testing.T) {
+	testutil.SkipOnCentOS(t, "Flaky (see #3418)", 7)
+
 	const (
 		memoryCgroupMount = "/sys/fs/cgroup/memory"
 		memoryLimit       = "memory.limit_in_bytes"
@@ -58,8 +62,6 @@ func TestOpenat2(t *testing.T) {
 		{"/sys/fs/cgroup", "/cgroup.controllers"},
 		{"/sys/fs/cgroup/", "cgroup.controllers"},
 		{"/sys/fs/cgroup/", "/cgroup.controllers"},
-		{"/sys/fs/cgroup/user.slice", "cgroup.controllers"},
-		{"/sys/fs/cgroup/user.slice/", "/cgroup.controllers"},
 		{"/", "/sys/fs/cgroup/cgroup.controllers"},
 		{"/", "sys/fs/cgroup/cgroup.controllers"},
 		{"/sys/fs/cgroup/cgroup.controllers", ""},

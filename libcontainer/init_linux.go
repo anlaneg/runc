@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/containerd/console"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -21,7 +23,6 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
@@ -44,6 +45,18 @@ type network struct {
 	// TempVethPeerName is a unique temporary veth peer name that was placed into
 	// the container's namespace.
 	TempVethPeerName string `json:"temp_veth_peer_name"`
+}
+
+type mountFds struct {
+	// sourceFds are the fds to use as source when mounting.
+	// The slice size should be the same as container mounts, as it will be
+	// paired with them.
+	// The value -1 is used when no fd is needed for the mount.
+	// Can't have a valid fd in the same position that other slices in this struct.
+	// We need to use only one of these fds on any single mount.
+	sourceFds []int
+	// Idem sourceFds, but fds of already created idmap mounts, to use with unix.MoveMount().
+	idmapFds []int
 }
 
 // initConfig is used for transferring parameters from Exec() to Init()
@@ -71,43 +84,193 @@ type initConfig struct {
 	Cgroup2Path      string                `json:"cgroup2_path,omitempty"`
 }
 
-type initer interface {
-	Init() error
+// Init is part of "runc init" implementation.
+func Init() {
+	runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
+
+	if err := startInitialization(); err != nil {
+		// If the error is returned, it was not communicated
+		// back to the parent (which is not a common case),
+		// so print it to stderr here as a last resort.
+		//
+		// Do not use logrus as we are not sure if it has been
+		// set up yet, but most important, if the parent is
+		// alive (and its log forwarding is working).
+		fmt.Fprintln(os.Stderr, err)
+	}
+	// Normally, StartInitialization() never returns, meaning
+	// if we are here, it had failed.
+	os.Exit(1)
 }
 
-func newContainerInit(t initType, pipe *os.File, consoleSocket *os.File, fifoFd, logFd int, mountFds []int) (initer, error) {
-	var config *initConfig
-	if err := json.NewDecoder(pipe).Decode(&config); err != nil {
-		return nil, err
+// Normally, this function does not return. If it returns, with or without an
+// error, it means the initialization has failed. If the error is returned,
+// it means the error can not be communicated back to the parent.
+func startInitialization() (retErr error) {
+	// Get the synchronisation pipe.
+	envSyncPipe := os.Getenv("_LIBCONTAINER_SYNCPIPE")
+	syncPipeFd, err := strconv.Atoi(envSyncPipe)
+	if err != nil {
+		return fmt.Errorf("unable to convert _LIBCONTAINER_SYNCPIPE: %w", err)
 	}
+	syncPipe := newSyncSocket(os.NewFile(uintptr(syncPipeFd), "sync"))
+	defer syncPipe.Close()
+
+	defer func() {
+		// If this defer is ever called, this means initialization has failed.
+		// Send the error back to the parent process in the form of an initError.
+		ierr := initError{Message: retErr.Error()}
+		if err := writeSyncArg(syncPipe, procError, ierr); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		// The error is sent, no need to also return it (or it will be reported twice).
+		retErr = nil
+	}()
+
+	// Get the INITPIPE.
+	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
+	initPipeFd, err := strconv.Atoi(envInitPipe)
+	if err != nil {
+		return fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
+	}
+	initPipe := os.NewFile(uintptr(initPipeFd), "init")
+	defer initPipe.Close()
+
+	// Set up logging. This is used rarely, and mostly for init debugging.
+
+	// Passing log level is optional; currently libcontainer/integration does not do it.
+	if levelStr := os.Getenv("_LIBCONTAINER_LOGLEVEL"); levelStr != "" {
+		logLevel, err := strconv.Atoi(levelStr)
+		if err != nil {
+			return fmt.Errorf("unable to convert _LIBCONTAINER_LOGLEVEL: %w", err)
+		}
+		logrus.SetLevel(logrus.Level(logLevel))
+	}
+
+	logFD, err := strconv.Atoi(os.Getenv("_LIBCONTAINER_LOGPIPE"))
+	if err != nil {
+		return fmt.Errorf("unable to convert _LIBCONTAINER_LOGPIPE: %w", err)
+	}
+
+	logrus.SetOutput(os.NewFile(uintptr(logFD), "logpipe"))
+	logrus.SetFormatter(new(logrus.JSONFormatter))
+	logrus.Debug("child process in init()")
+
+	// Only init processes have FIFOFD.
+	fifofd := -1
+	envInitType := os.Getenv("_LIBCONTAINER_INITTYPE")
+	it := initType(envInitType)
+	if it == initStandard {
+		envFifoFd := os.Getenv("_LIBCONTAINER_FIFOFD")
+		if fifofd, err = strconv.Atoi(envFifoFd); err != nil {
+			return fmt.Errorf("unable to convert _LIBCONTAINER_FIFOFD: %w", err)
+		}
+	}
+
+	var consoleSocket *os.File
+	if envConsole := os.Getenv("_LIBCONTAINER_CONSOLE"); envConsole != "" {
+		console, err := strconv.Atoi(envConsole)
+		if err != nil {
+			return fmt.Errorf("unable to convert _LIBCONTAINER_CONSOLE: %w", err)
+		}
+		consoleSocket = os.NewFile(uintptr(console), "console-socket")
+		defer consoleSocket.Close()
+	}
+
+	var pidfdSocket *os.File
+	if envSockFd := os.Getenv("_LIBCONTAINER_PIDFD_SOCK"); envSockFd != "" {
+		sockFd, err := strconv.Atoi(envSockFd)
+		if err != nil {
+			return fmt.Errorf("unable to convert _LIBCONTAINER_PIDFD_SOCK: %w", err)
+		}
+		pidfdSocket = os.NewFile(uintptr(sockFd), "pidfd-socket")
+		defer pidfdSocket.Close()
+	}
+
+	// Get mount files (O_PATH).
+	mountSrcFds, err := parseFdsFromEnv("_LIBCONTAINER_MOUNT_FDS")
+	if err != nil {
+		return err
+	}
+
+	// Get idmap fds.
+	idmapFds, err := parseFdsFromEnv("_LIBCONTAINER_IDMAP_FDS")
+	if err != nil {
+		return err
+	}
+
+	// Get runc-dmz fds.
+	var dmzExe *os.File
+	if dmzFdStr := os.Getenv("_LIBCONTAINER_DMZEXEFD"); dmzFdStr != "" {
+		dmzFd, err := strconv.Atoi(dmzFdStr)
+		if err != nil {
+			return fmt.Errorf("unable to convert _LIBCONTAINER_DMZEXEFD: %w", err)
+		}
+		unix.CloseOnExec(dmzFd)
+		dmzExe = os.NewFile(uintptr(dmzFd), "runc-dmz")
+	}
+
+	// clear the current process's environment to clean any libcontainer
+	// specific env vars.
+	os.Clearenv()
+
+	defer func() {
+		if err := recover(); err != nil {
+			if err2, ok := err.(error); ok {
+				retErr = fmt.Errorf("panic from initialization: %w, %s", err2, debug.Stack())
+			} else {
+				retErr = fmt.Errorf("panic from initialization: %v, %s", err, debug.Stack())
+			}
+		}
+	}()
+
+	var config initConfig
+	if err := json.NewDecoder(initPipe).Decode(&config); err != nil {
+		return err
+	}
+
+	// If init succeeds, it will not return, hence none of the defers will be called.
+	return containerInit(it, &config, syncPipe, consoleSocket, pidfdSocket, fifofd, logFD, dmzExe, mountFds{sourceFds: mountSrcFds, idmapFds: idmapFds})
+}
+
+func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSocket, pidfdSocket *os.File, fifoFd, logFd int, dmzExe *os.File, mountFds mountFds) error {
 	if err := populateProcessEnvironment(config.Env); err != nil {
-		return nil, err
+		return err
 	}
+
 	switch t {
 	case initSetns:
-		// mountFds must be nil in this case. We don't mount while doing runc exec.
-		if mountFds != nil {
-			return nil, errors.New("mountFds must be nil; can't mount from exec")
+		// mount and idmap fds must be nil in this case. We don't mount while doing runc exec.
+		if mountFds.sourceFds != nil || mountFds.idmapFds != nil {
+			return errors.New("mount and idmap fds must be nil; can't mount from exec")
 		}
 
-		return &linuxSetnsInit{
+		i := &linuxSetnsInit{
 			pipe:          pipe,
 			consoleSocket: consoleSocket,
+			pidfdSocket:   pidfdSocket,
 			config:        config,
 			logFd:         logFd,
-		}, nil
+			dmzExe:        dmzExe,
+		}
+		return i.Init()
 	case initStandard:
-		return &linuxStandardInit{
+		i := &linuxStandardInit{
 			pipe:          pipe,
 			consoleSocket: consoleSocket,
+			pidfdSocket:   pidfdSocket,
 			parentPid:     unix.Getppid(),
 			config:        config,
 			fifoFd:        fifoFd,
 			logFd:         logFd,
+			dmzExe:        dmzExe,
 			mountFds:      mountFds,
-		}, nil
+		}
+		return i.Init()
 	}
-	return nil, fmt.Errorf("unknown init type %q", t)
+	return fmt.Errorf("unknown init type %q", t)
 }
 
 // populateProcessEnvironment loads the provided environment variables into the
@@ -116,17 +279,17 @@ func populateProcessEnvironment(env []string) error {
 	for _, pair := range env {
 		p := strings.SplitN(pair, "=", 2)
 		if len(p) < 2 {
-			return fmt.Errorf("invalid environment variable: %q", pair)
+			return errors.New("invalid environment variable: missing '='")
 		}
 		name, val := p[0], p[1]
 		if name == "" {
-			return fmt.Errorf("environment variable name can't be empty: %q", pair)
+			return errors.New("invalid environment variable: name cannot be empty")
 		}
 		if strings.IndexByte(name, 0) >= 0 {
-			return fmt.Errorf("environment variable name can't contain null(\\x00): %q", pair)
+			return fmt.Errorf("invalid environment variable %q: name contains nul byte (\\x00)", name)
 		}
 		if strings.IndexByte(val, 0) >= 0 {
-			return fmt.Errorf("environment variable value can't contain null(\\x00): %q", pair)
+			return fmt.Errorf("invalid environment variable %q: value contains nul byte (\\x00)", name)
 		}
 		if err := os.Setenv(name, val); err != nil {
 			return err
@@ -221,7 +384,6 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 	if err != nil {
 		return err
 	}
-
 	// After we return from here, we don't need the console anymore.
 	defer pty.Close()
 
@@ -243,9 +405,11 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 		}
 	}
 	// While we can access console.master, using the API is a good idea.
-	if err := utils.SendFd(socket, pty.Name(), pty.Fd()); err != nil {
+	if err := utils.SendRawFd(socket, pty.Name(), pty.Fd()); err != nil {
 		return err
 	}
+	runtime.KeepAlive(pty)
+
 	// Now, dup over all the things.
 	return dupStdio(slavePath)
 }
@@ -253,12 +417,11 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 // syncParentReady sends to the given pipe a JSON payload which indicates that
 // the init is ready to Exec the child process. It then waits for the parent to
 // indicate that it is cleared to Exec.
-func syncParentReady(pipe io.ReadWriter) error {
+func syncParentReady(pipe *syncSocket) error {
 	// Tell parent.
 	if err := writeSync(pipe, procReady); err != nil {
 		return err
 	}
-
 	// Wait for parent to give the all-clear.
 	return readSync(pipe, procRun)
 }
@@ -266,44 +429,37 @@ func syncParentReady(pipe io.ReadWriter) error {
 // syncParentHooks sends to the given pipe a JSON payload which indicates that
 // the parent should execute pre-start hooks. It then waits for the parent to
 // indicate that it is cleared to resume.
-func syncParentHooks(pipe io.ReadWriter) error {
+func syncParentHooks(pipe *syncSocket) error {
 	// Tell parent.
 	if err := writeSync(pipe, procHooks); err != nil {
 		return err
 	}
-
 	// Wait for parent to give the all-clear.
-	return readSync(pipe, procResume)
+	return readSync(pipe, procHooksDone)
 }
 
-// syncParentSeccomp sends to the given pipe a JSON payload which
-// indicates that the parent should pick up the seccomp fd with pidfd_getfd()
-// and send it to the seccomp agent over a unix socket. It then waits for
-// the parent to indicate that it is cleared to resume and closes the seccompFd.
-// If the seccompFd is -1, there isn't anything to sync with the parent, so it
-// returns no error.
-func syncParentSeccomp(pipe io.ReadWriter, seccompFd int) error {
-	if seccompFd == -1 {
+// syncParentSeccomp sends the fd associated with the seccomp file descriptor
+// to the parent, and wait for the parent to do pidfd_getfd() to grab a copy.
+func syncParentSeccomp(pipe *syncSocket, seccompFd *os.File) error {
+	if seccompFd == nil {
 		return nil
 	}
+	defer seccompFd.Close()
 
-	// Tell parent.
-	if err := writeSyncWithFd(pipe, procSeccomp, seccompFd); err != nil {
-		unix.Close(seccompFd)
+	// Tell parent to grab our fd.
+	//
+	// Notably, we do not use writeSyncFile here because a container might have
+	// an SCMP_ACT_NOTIFY action on sendmsg(2) so we need to use the smallest
+	// possible number of system calls here because all of those syscalls
+	// cannot be used with SCMP_ACT_NOTIFY as a result (any syscall we use here
+	// before the parent gets the file descriptor would deadlock "runc init" if
+	// we allowed it for SCMP_ACT_NOTIFY). See seccomp.InitSeccomp() for more
+	// details.
+	if err := writeSyncArg(pipe, procSeccomp, seccompFd.Fd()); err != nil {
 		return err
 	}
-
-	// Wait for parent to give the all-clear.
-	if err := readSync(pipe, procSeccompDone); err != nil {
-		unix.Close(seccompFd)
-		return fmt.Errorf("sync parent seccomp: %w", err)
-	}
-
-	if err := unix.Close(seccompFd); err != nil {
-		return fmt.Errorf("close seccomp fd: %w", err)
-	}
-
-	return nil
+	// Wait for parent to tell us they've grabbed the seccompfd.
+	return readSync(pipe, procSeccompDone)
 }
 
 // setupUser changes the groups, gid, and uid for the user inside the container
@@ -336,15 +492,6 @@ func setupUser(config *initConfig) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Rather than just erroring out later in setuid(2) and setgid(2), check
-	// that the user is mapped here.
-	if _, err := config.Config.HostUID(execUser.Uid); err != nil {
-		return errors.New("cannot set uid to unmapped user in user namespace")
-	}
-	if _, err := config.Config.HostGID(execUser.Gid); err != nil {
-		return errors.New("cannot set gid to unmapped user in user namespace")
 	}
 
 	if config.RootlessEUID {
@@ -381,10 +528,16 @@ func setupUser(config *initConfig) error {
 		}
 	}
 
-	if err := system.Setgid(execUser.Gid); err != nil {
+	if err := unix.Setgid(execUser.Gid); err != nil {
+		if err == unix.EINVAL {
+			return fmt.Errorf("cannot setgid to unmapped gid %d in user namespace", execUser.Gid)
+		}
 		return err
 	}
-	if err := system.Setuid(execUser.Uid); err != nil {
+	if err := unix.Setuid(execUser.Uid); err != nil {
+		if err == unix.EINVAL {
+			return fmt.Errorf("cannot setuid to unmapped uid %d in user namespace", execUser.Uid)
+		}
 		return err
 	}
 
@@ -411,8 +564,9 @@ func fixStdioPermissions(u *user.ExecUser) error {
 			return &os.PathError{Op: "fstat", Path: file.Name(), Err: err}
 		}
 
-		// Skip chown if uid is already the one we want.
-		if int(s.Uid) == u.Uid {
+		// Skip chown if uid is already the one we want or any of the STDIO descriptors
+		// were redirected to /dev/null.
+		if int(s.Uid) == u.Uid || s.Rdev == null.Rdev {
 			continue
 		}
 
@@ -496,38 +650,41 @@ func setupRlimits(limits []configs.Rlimit, pid int) error {
 	return nil
 }
 
-const _P_PID = 1
-
-//nolint:structcheck,unused
-type siginfo struct {
-	si_signo int32
-	si_errno int32
-	si_code  int32
-	// below here is a union; si_pid is the only field we use
-	si_pid int32
-	// Pad to 128 bytes as detailed in blockUntilWaitable
-	pad [96]byte
+func setupScheduler(config *configs.Config) error {
+	attr, err := configs.ToSchedAttr(config.Scheduler)
+	if err != nil {
+		return err
+	}
+	if err := unix.SchedSetAttr(0, attr, 0); err != nil {
+		if errors.Is(err, unix.EPERM) && config.Cgroups.CpusetCpus != "" {
+			return errors.New("process scheduler can't be used together with AllowedCPUs")
+		}
+		return fmt.Errorf("error setting scheduler: %w", err)
+	}
+	return nil
 }
 
-// isWaitable returns true if the process has exited false otherwise.
-// Its based off blockUntilWaitable in src/os/wait_waitid.go
-func isWaitable(pid int) (bool, error) {
-	si := &siginfo{}
-	_, _, e := unix.Syscall6(unix.SYS_WAITID, _P_PID, uintptr(pid), uintptr(unsafe.Pointer(si)), unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, 0, 0)
-	if e != 0 {
-		return false, &os.SyscallError{Syscall: "waitid", Err: e}
-	}
-
-	return si.si_pid != 0, nil
+func setupPersonality(config *configs.Config) error {
+	return system.SetLinuxPersonality(config.Personality.Domain)
 }
 
 // signalAllProcesses freezes then iterates over all the processes inside the
 // manager's cgroups sending the signal s to them.
-// If s is SIGKILL then it will wait for each process to exit.
-// For all other signals it will check if the process is ready to report its
-// exit status and only if it is will a wait be performed.
-func signalAllProcesses(m cgroups.Manager, s os.Signal) error {
-	var procs []*os.Process
+func signalAllProcesses(m cgroups.Manager, s unix.Signal) error {
+	if !m.Exists() {
+		return ErrNotRunning
+	}
+	// Use cgroup.kill, if available.
+	if s == unix.SIGKILL {
+		if p := m.Path(""); p != "" { // Either cgroup v2 or hybrid.
+			err := cgroups.WriteFile(p, "cgroup.kill", "1")
+			if err == nil || !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			// Fallback to old implementation.
+		}
+	}
+
 	if err := m.Freeze(configs.Frozen); err != nil {
 		logrus.Warn(err)
 	}
@@ -539,55 +696,31 @@ func signalAllProcesses(m cgroups.Manager, s os.Signal) error {
 		return err
 	}
 	for _, pid := range pids {
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			logrus.Warn(err)
-			continue
-		}
-		procs = append(procs, p)
-		if err := p.Signal(s); err != nil {
-			logrus.Warn(err)
+		err := unix.Kill(pid, s)
+		if err != nil && err != unix.ESRCH {
+			logrus.Warnf("kill %d: %v", pid, err)
 		}
 	}
 	if err := m.Freeze(configs.Thawed); err != nil {
 		logrus.Warn(err)
 	}
 
-	subreaper, err := system.GetSubreaper()
-	if err != nil {
-		// The error here means that PR_GET_CHILD_SUBREAPER is not
-		// supported because this code might run on a kernel older
-		// than 3.4. We don't want to throw an error in that case,
-		// and we simplify things, considering there is no subreaper
-		// set.
-		subreaper = 0
-	}
-
-	for _, p := range procs {
-		if s != unix.SIGKILL {
-			if ok, err := isWaitable(p.Pid); err != nil {
-				if !errors.Is(err, unix.ECHILD) {
-					logrus.Warn("signalAllProcesses: ", p.Pid, err)
-				}
-				continue
-			} else if !ok {
-				// Not ready to report so don't wait
-				continue
-			}
-		}
-
-		// In case a subreaper has been setup, this code must not
-		// wait for the process. Otherwise, we cannot be sure the
-		// current process will be reaped by the subreaper, while
-		// the subreaper might be waiting for this process in order
-		// to retrieve its exit code.
-		if subreaper == 0 {
-			if _, err := p.Wait(); err != nil {
-				if !errors.Is(err, unix.ECHILD) {
-					logrus.Warn("wait: ", err)
-				}
-			}
-		}
-	}
 	return nil
+}
+
+// setupPidfd opens a process file descriptor of init process, and sends the
+// file descriptor back to the socket.
+func setupPidfd(socket *os.File, initType string) error {
+	defer socket.Close()
+
+	pidFd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		return fmt.Errorf("failed to pidfd_open: %w", err)
+	}
+
+	if err := utils.SendRawFd(socket, initType, uintptr(pidFd)); err != nil {
+		unix.Close(pidFd)
+		return fmt.Errorf("failed to send pidfd on socket: %w", err)
+	}
+	return unix.Close(pidFd)
 }

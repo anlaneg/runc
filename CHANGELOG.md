@@ -1,4 +1,4 @@
-# Changelog/
+# Changelog
 This file documents all notable changes made to this project since runc 1.0.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
@@ -12,11 +12,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    be removed entirely in a future release. Users who need a non-standard
    `criu` binary should rely on the standard way of looking up binaries in
    `$PATH`. (#3316)
+ * `runc kill` option `-a` is now deprecated. Previously, it had to be specified
+   to kill a container (with SIGKILL) which does not have its own private PID
+   namespace (so that runc would send SIGKILL to all processes). Now, this is
+   done automatically. (#3864, #3825)
 
 ### Changed
 
  * When Intel RDT feature is not available, its initialization is skipped,
    resulting in slightly faster `runc exec` and `runc run`. (#3306)
+ * Enforce absolute paths for mounts. (#3020, #3717)
+ * libcontainer users that create and kill containers from a daemon process
+   (so that the container init is a child of that process) must now implement
+   a proper child reaper in case a container does not have its own private PID
+   namespace, as documented in `container.Signal`. (#3825)
+ * Sum `anon` and `file` from `memory.stat` for cgroupv2 root usage,
+   as the root does not have `memory.current` for cgroupv2.
+   This aligns cgroupv2 root usage more closely with cgroupv1 reporting.
+   Additionally, report root swap usage as sum of swap and memory usage,
+   aligned with v1 and existing non-root v2 reporting. (#3933)
+ * Add `swapOnlyUsage` in `MemoryStats`. This field reports swap-only usage.
+   For cgroupv1, `Usage` and `Failcnt` are set by subtracting memory usage
+   from memory+swap usage. For cgroupv2, `Usage`, `Limit`, and `MaxUsage`
+   are set. (#4010)
 
 ### Fixed
 
@@ -26,6 +44,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    s390 and s390x. This solves the issue where syscalls the host kernel did not
    support would return `-EPERM` despite the existence of the `-ENOSYS` stub
    code (this was due to how s390x does syscall multiplexing). (#3474)
+ * Remove tun/tap from the default device rules. (#3468)
+ * specconv: avoid mapping "acl" to MS_POSIXACL. (#3739)
+
+## [1.1.8] - 2023-07-20
+
+> 海纳百川 有容乃大
+
+### Added
+
+* Support riscv64. (#3905)
+
+### Fixed
+
+* init: do not print environment variable value. (#3879)
+* libct: fix a race with systemd removal. (#3877)
+* tests/int: increase num retries for oom tests. (#3891)
+* man/runc: fixes. (#3892)
+* Fix tmpfs mode opts when dir already exists. (#3916)
+* docs/systemd: fix a broken link. (#3917)
+* ci/cirrus: enable some rootless tests on cs9. (#3918)
+* runc delete: call systemd's reset-failed. (#3932)
+* libct/cg/sd/v1: do not update non-frozen cgroup after frozen failed. (#3921)
+
+### Changed
+
+* CI: bump Fedora, Vagrant, bats. (#3878)
+* `.codespellrc`: update for 2.2.5. (#3909)
+
+## [1.1.7] - 2023-04-26
+
+> Ночевала тучка золотая на груди утеса-великана.
+
+### Fixed
+
+* When used with systemd v240+, systemd cgroup drivers no longer skip
+  `DeviceAllow` rules if the device does not exist (a regression introduced
+  in runc 1.1.3). This fix also reverts the workaround added in runc 1.1.5,
+  removing an extra warning emitted by runc run/start. (#3845, #3708, #3671)
+
+### Added
+
+* The source code now has a new file, `runc.keyring`, which contains the keys
+  used to sign runc releases. (#3838)
+
+## [1.1.6] - 2023-04-11
+
+> In this world nothing is certain but death and taxes.
+
+### Compatibility
+
+* This release can no longer be built from sources using Go 1.16. Using a
+  latest maintained Go 1.20.x or Go 1.19.x release is recommended.
+  Go 1.17 can still be used.
+
+### Fixed
+
+* systemd cgroup v1 and v2 drivers were deliberately ignoring `UnitExist` error
+  from systemd while trying to create a systemd unit, which in some scenarios
+  may result in a container not being added to the proper systemd unit and
+  cgroup. (#3780, #3806)
+* systemd cgroup v2 driver was incorrectly translating cpuset range from spec's
+  `resources.cpu.cpus` to systemd unit property (`AllowedCPUs`) in case of more
+  than 8 CPUs, resulting in the wrong AllowedCPUs setting. (#3808)
+* systemd cgroup v1 driver was prefixing container's cgroup path with the path
+  of PID 1 cgroup, resulting in inability to place PID 1 in a non-root cgroup.
+  (#3811)
+* runc run/start may return "permission denied" error when starting a rootless
+  container when the file to be executed does not have executable bit set for
+  the user, not taking the `CAP_DAC_OVERRIDE` capability into account. This is
+  a regression in runc 1.1.4, as well as in Go 1.20 and 1.20.1 (#3715, #3817)
+* cgroup v1 drivers are now aware of `misc` controller. (#3823)
+* Various CI fixes and improvements, mostly to ensure Go 1.19.x and Go 1.20.x
+  compatibility.
+
+## [1.1.5] - 2023-03-29
+
+> 囚われた屈辱は
+> 反撃の嚆矢だ
+
+### Security
+
+The following CVEs were fixed in this release:
+
+* [CVE-2023-25809][] is a vulnerability involving rootless containers where
+  (under specific configurations), the container would have write access to the
+  `/sys/fs/cgroup/user.slice/...` cgroup hierarchy. No other hierarchies on the
+  host were affected. This vulnerability was discovered by Akihiro Suda.
+
+* [CVE-2023-27561][] was a regression in our protections against tricky `/proc`
+  and `/sys` configurations (where the container mountpoint is a symlink)
+  causing us to be tricked into incorrectly configuring the container, which
+  effectively re-introduced [CVE-2019-19921][]. This regression was present
+  from v1.0.0-rc95 to v1.1.4 and was discovered by @Beuc. (#3785)
+
+* [CVE-2023-28642][] is a different attack vector using the same regression
+  as in [CVE-2023-27561][]. This was reported by Lei Wang.
+
+[CVE-2019-19921]: https://github.com/advisories/GHSA-fh74-hm69-rqjw
+[CVE-2023-25809]: https://github.com/opencontainers/runc/security/advisories/GHSA-m8cg-xc2p-r3fc
+[CVE-2023-27561]: https://github.com/advisories/GHSA-vpvm-3wq2-2wvm
+[CVE-2023-28642]: https://github.com/opencontainers/runc/security/advisories/GHSA-g2j6-57v7-gm8c
+
+### Fixed
+
+* Fix the inability to use `/dev/null` when inside a container. (#3620)
+* Fix changing the ownership of host's `/dev/null` caused by fd redirection
+  (a regression in 1.1.1). (#3674, #3731)
+* Fix rare runc exec/enter unshare error on older kernels, including
+  CentOS < 7.7. (#3776)
+* nsexec: Check for errors in `write_log()`. (#3721)
+* Various CI fixes and updates. (#3618, #3630, #3640, #3729)
+
+## [1.1.4] - 2022-08-24
+
+> If you look for perfection, you'll never be content.
+
+### Fixed
+
+* Fix mounting via wrong proc fd.
+  When the user and mount namespaces are used, and the bind mount is followed by
+  the cgroup mount in the spec, the cgroup was mounted using the bind mount's
+  mount fd. (#3511)
+* Switch `kill()` in `libcontainer/nsenter` to `sane_kill()`. (#3536)
+* Fix "permission denied" error from `runc run` on `noexec` fs. (#3541)
+* Fix failed exec after `systemctl daemon-reload`.
+  Due to a regression in v1.1.3, the `DeviceAllow=char-pts rwm` rule was no
+  longer added and was causing an error `open /dev/pts/0: operation not permitted: unknown`
+  when systemd was reloaded. (#3554)
+* Various CI fixes. (#3538, #3558, #3562)
+
+## [1.1.3] - 2022-06-09
+
+> In the beginning there was nothing, which exploded.
+
+### Fixed
+ * Our seccomp `-ENOSYS` stub now correctly handles multiplexed syscalls on
+   s390 and s390x. This solves the issue where syscalls the host kernel did not
+   support would return `-EPERM` despite the existence of the `-ENOSYS` stub
+   code (this was due to how s390x does syscall multiplexing). (#3478)
+ * Retry on dbus disconnect logic in libcontainer/cgroups/systemd now works as
+   intended; this fix does not affect runc binary itself but is important for
+   libcontainer users such as Kubernetes. (#3476)
+ * Inability to compile with recent clang due to an issue with duplicate
+   constants in libseccomp-golang. (#3477)
+ * When using systemd cgroup driver, skip adding device paths that don't exist,
+   to stop systemd from emitting warnings about those paths. (#3504)
+ * Socket activation was failing when more than 3 sockets were used. (#3494)
+ * Various CI fixes. (#3472, #3479)
+
+### Added
+ * Allow to bind mount /proc/sys/kernel/ns_last_pid to inside container. (#3493)
+
+### Changed
+ * runc static binaries are now linked against libseccomp v2.5.4. (#3481)
+
+
+## [1.1.2] - 2022-05-11
+
+> I should think I'm going to be a perpetual student.
+
+### Security
+ * A bug was found in runc where runc exec --cap executed processes with
+   non-empty inheritable Linux process capabilities, creating an atypical Linux
+   environment. For more information, see [GHSA-f3fp-gc8g-vw66][] and
+   CVE-2022-29162.
+
+### Changed
+ * `runc spec` no longer sets any inheritable capabilities in the created
+   example OCI spec (`config.json`) file.
+
+[GHSA-f3fp-gc8g-vw66]: https://github.com/opencontainers/runc/security/advisories/GHSA-f3fp-gc8g-vw66
+
+
+## [1.1.1] - 2022-03-28
+
+> Violence is the last refuge of the incompetent.
+
+### Added
+ * CI is now also run on centos-stream-9. (#3436)
+
+### Fixed
+ * `runc run/start` can now run a container with read-only `/dev` in OCI spec,
+   rather than error out. (#3355)
+ * `runc exec` now ensures that `--cgroup` argument is a sub-cgroup. (#3403)
+ * libcontainer systemd v2 manager no longer errors out if one of the files
+   listed in `/sys/kernel/cgroup/delegate` do not exist in container's cgroup.
+   (#3387, #3404)
+ * Loose OCI spec validation to avoid bogus "Intel RDT is not supported" error.
+   (#3406)
+ * libcontainer/cgroups no longer panics in cgroup v1 managers if `stat`
+   of `/sys/fs/cgroup/unified` returns an error other than ENOENT. (#3435)
+
 
 ## [1.1.0] - 2022-01-14
 
@@ -36,6 +246,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    correctly compiled (specifically this requires CGO to be enabled). This
    should avoid folks accidentally creating broken runc binaries (and
    incorrectly importing our internal libraries into their projects). (#3331)
+
 
 ## [1.1.0-rc.1] - 2021-12-14
 
@@ -62,7 +273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    binary etc.) and failures of the command being executed. (#3073)
  * runc run: new `--keep` option to skip removal exited containers artefacts.
    This might be useful to check the state (e.g. of cgroup controllers) after
-   the container has￼exited. (#2817, #2825)
+   the container has exited. (#2817, #2825)
  * seccomp: add support for `SCMP_ACT_KILL_PROCESS` and `SCMP_ACT_KILL_THREAD`
    (the latter is just an alias for `SCMP_ACT_KILL`). (#3204)
  * seccomp: add support for `SCMP_ACT_NOTIFY` (seccomp actions). This allows
@@ -151,13 +362,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
  * Fixed inability to start a container with read-write bind mount of a
    read-only fuse host mount. (#3283, #3292)
- * Fixed inability to start when read-only /dev in set in spec (#3276, #3277)
+ * Fixed inability to start when read-only /dev in set in spec. (#3276, #3277)
  * Fixed not removing sub-cgroups upon container delete, when rootless cgroup v2
    is used with older systemd. (#3226, #3297)
  * Fixed returning error from GetStats when hugetlb is unsupported (which causes
    excessive logging for Kubernetes). (#3233, #3295)
  * Improved an error message when dbus-user-session is not installed and
-   rootless + cgroup2 + systemd are used (#3212)
+   rootless + cgroup2 + systemd are used. (#3212)
 
 [GHSA-v95c-p5hm-xq8f]: https://github.com/opencontainers/runc/security/advisories/GHSA-v95c-p5hm-xq8f
 
@@ -237,7 +448,7 @@ implementation (libcontainer) is *not* covered by this policy.
    code, optimize the method for checking whether a cgroup is frozen. (#2955)
  * cgroups/systemd: fixed "retry on dbus disconnect" logic introduced in rc94
  * cgroups/systemd: fixed returning "unit already exists" error from a systemd
-   cgroup manager (regression in rc94) (#2997, #2996)
+   cgroup manager (regression in rc94). (#2997, #2996)
 
 ### Added
  * cgroupv2: support SkipDevices with systemd driver. (#2958, #3019)
@@ -246,7 +457,7 @@ implementation (libcontainer) is *not* covered by this policy.
    (#3022)
 
 ### Changed
- * cgroup/systemd: return, not ignore, stop unit error from Destroy (#2946)
+ * cgroup/systemd: return, not ignore, stop unit error from Destroy. (#2946)
  * Fix all golangci-lint failures. (#2781, #2962)
  * Make `runc --version` output sane even when built with `go get` or
    otherwise outside of our build scripts. (#2962)
@@ -265,5 +476,13 @@ implementation (libcontainer) is *not* covered by this policy.
 [1.0.1]: https://github.com/opencontainers/runc/compare/v1.0.0...v1.0.1
 
 <!-- 1.1.z patch releases -->
-[Unreleased 1.1.z]: https://github.com/opencontainers/runc/compare/v1.1.0...release-1.1
+[Unreleased 1.1.z]: https://github.com/opencontainers/runc/compare/v1.1.8...release-1.1
+[1.1.8]: https://github.com/opencontainers/runc/compare/v1.1.7...v1.1.8
+[1.1.7]: https://github.com/opencontainers/runc/compare/v1.1.6...v1.1.7
+[1.1.6]: https://github.com/opencontainers/runc/compare/v1.1.5...v1.1.6
+[1.1.5]: https://github.com/opencontainers/runc/compare/v1.1.4...v1.1.5
+[1.1.4]: https://github.com/opencontainers/runc/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/opencontainers/runc/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/opencontainers/runc/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/opencontainers/runc/compare/v1.1.0...v1.1.1
 [1.1.0-rc.1]: https://github.com/opencontainers/runc/compare/v1.0.0...v1.1.0-rc.1

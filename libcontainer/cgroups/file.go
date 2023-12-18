@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -50,22 +51,11 @@ func WriteFile(dir, file, data string) error {
 		return err
 	}
 	defer fd.Close()
-	if err := retryingWriteFile(fd, data); err != nil {
+	if _, err := fd.WriteString(data); err != nil {
 		// Having data in the error message helps in debugging.
 		return fmt.Errorf("failed to write %q: %w", data, err)
 	}
 	return nil
-}
-
-func retryingWriteFile(fd *os.File, data string) error {
-	for {
-		_, err := fd.Write([]byte(data))
-		if errors.Is(err, unix.EINTR) {
-			logrus.Infof("interrupted while writing %s to %s", data, fd.Name())
-			continue
-		}
-		return err
-	}
 }
 
 const (
@@ -90,7 +80,7 @@ func prepareOpenat2() error {
 		})
 		if err != nil {
 			prepErr = &os.PathError{Op: "openat2", Path: cgroupfsDir, Err: err}
-			if err != unix.ENOSYS { //nolint:errorlint // unix errors are bare
+			if err != unix.ENOSYS {
 				logrus.Warnf("falling back to securejoin: %s", prepErr)
 			} else {
 				logrus.Debug("openat2 not available, falling back to securejoin")
@@ -123,7 +113,7 @@ func openFile(dir, file string, flags int) (*os.File, error) {
 		flags |= os.O_TRUNC | os.O_CREATE
 		mode = 0o600
 	}
-	path := path.Join(dir, file)
+	path := path.Join(dir, utils.CleanPath(file))
 	if prepareOpenat2() != nil {
 		return openFallback(path, flags, mode)
 	}

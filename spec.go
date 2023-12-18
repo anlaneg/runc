@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
@@ -143,7 +144,9 @@ func loadSpec(cPath string) (spec *specs.Spec, err error) {
 	if err = json.NewDecoder(cf).Decode(&spec); err != nil {
 		return nil, err
 	}
-	
+	if spec == nil {
+		return nil, errors.New("config cannot be null")
+	}
 	/*返回配置的spec对象*/
 	return spec, validateProcessSpec(spec.Process)
 }

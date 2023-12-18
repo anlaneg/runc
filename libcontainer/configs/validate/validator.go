@@ -11,6 +11,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -24,12 +25,14 @@ func Validate(config *configs.Config) error {
 		cgroupsCheck,
 		rootfs,
 		network,
-		hostname,
+		uts,
 		security,
 		namespaces,
 		sysctl,
 		intelrdtCheck,
 		rootlessEUIDCheck,
+		mountsStrict,
+		scheduler,
 	}
 	
 	/*遍历执行这组checks回调，如果遇到err,则直接返回*/
@@ -42,11 +45,11 @@ func Validate(config *configs.Config) error {
 	/*遍历执行warns回调，如果遇到err,则进行告警*/
 	// Relaxed validation rules for backward compatibility
 	warns := []check{
-		mounts, // TODO (runc v1.x.x): make this an error instead of a warning
+		mountsWarn,
 	}
 	for _, c := range warns {
 		if err := c(config); err != nil {
-			logrus.WithError(err).Warn("invalid configuration")
+			logrus.WithError(err).Warn("configuration")
 		}
 	}
 	return nil
@@ -80,9 +83,12 @@ func network(config *configs.Config) error {
 	return nil
 }
 
-func hostname(config *configs.Config) error {
+func uts(config *configs.Config) error {
 	if config.Hostname != "" && !config.Namespaces.Contains(configs.NEWUTS) {
 		return errors.New("unable to set hostname without a private UTS namespace")
+	}
+	if config.Domainname != "" && !config.Namespaces.Contains(configs.NEWUTS) {
+		return errors.New("unable to set domainname without a private UTS namespace")
 	}
 	return nil
 }
@@ -103,11 +109,19 @@ func security(config *configs.Config) error {
 func namespaces(config *configs.Config) error {
 	if config.Namespaces.Contains(configs.NEWUSER) {
 		if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
-			return errors.New("USER namespaces aren't enabled in the kernel")
+			return errors.New("user namespaces aren't enabled in the kernel")
 		}
+		hasPath := config.Namespaces.PathOf(configs.NEWUSER) != ""
+		hasMappings := config.UIDMappings != nil || config.GIDMappings != nil
+		if !hasPath && !hasMappings {
+			return errors.New("user namespaces enabled, but no namespace path to join nor mappings to apply specified")
+		}
+		// The hasPath && hasMappings validation case is handled in specconv --
+		// we cache the mappings in Config during specconv in the hasPath case,
+		// so we cannot do that validation here.
 	} else {
-		if config.UidMappings != nil || config.GidMappings != nil {
-			return errors.New("User namespace mappings specified, but USER namespace isn't enabled in the config")
+		if config.UIDMappings != nil || config.GIDMappings != nil {
+			return errors.New("user namespace mappings specified, but user namespace isn't enabled in the config")
 		}
 	}
 
@@ -117,15 +131,29 @@ func namespaces(config *configs.Config) error {
 		}
 	}
 
+	if config.Namespaces.Contains(configs.NEWTIME) {
+		if _, err := os.Stat("/proc/self/timens_offsets"); os.IsNotExist(err) {
+			return errors.New("time namespaces aren't enabled in the kernel")
+		}
+		hasPath := config.Namespaces.PathOf(configs.NEWTIME) != ""
+		hasOffsets := config.TimeOffsets != nil
+		if hasPath && hasOffsets {
+			return errors.New("time namespace enabled, but both namespace path and time offsets specified -- you may only provide one")
+		}
+	} else {
+		if config.TimeOffsets != nil {
+			return errors.New("time namespace offsets specified, but time namespace isn't enabled in the config")
+		}
+	}
+
 	return nil
 }
 
 // convertSysctlVariableToDotsSeparator can return sysctl variables in dots separator format.
 // The '/' separator is also accepted in place of a '.'.
 // Convert the sysctl variables to dots separator format for validation.
-// More info:
-//   https://man7.org/linux/man-pages/man8/sysctl.8.html
-//   https://man7.org/linux/man-pages/man5/sysctl.d.5.html
+// More info: sysctl(8), sysctl.d(5).
+//
 // For example:
 // Input sysctl variable "net/ipv4/conf/eno2.100.rp_filter"
 // will return the converted value "net.ipv4.conf.eno2/100.rp_filter"
@@ -265,14 +293,93 @@ func cgroupsCheck(config *configs.Config) error {
 	return nil
 }
 
-func mounts(config *configs.Config) error {
-	for _, m := range config.Mounts {
-		if !filepath.IsAbs(m.Destination) {
-			return fmt.Errorf("invalid mount %+v: mount destination not absolute", m)
-		}
+func checkBindOptions(m *configs.Mount) error {
+	if !m.IsBind() {
+		return nil
+	}
+	// We must reject bind-mounts that also have filesystem-specific mount
+	// options, because the kernel will completely ignore these flags and we
+	// cannot set them per-mountpoint.
+	//
+	// It should be noted that (due to how the kernel caches superblocks), data
+	// options could also silently ignored for other filesystems even when
+	// doing a fresh mount, but there is no real way to avoid this (and it
+	// matches how everything else works). There have been proposals to make it
+	// possible for userspace to detect this caching, but this wouldn't help
+	// runc because the behaviour wouldn't even be desirable for most users.
+	if m.Data != "" {
+		return errors.New("bind mounts cannot have any filesystem-specific options applied")
+	}
+	return nil
+}
+
+func checkIDMapMounts(config *configs.Config, m *configs.Mount) error {
+	if !m.IsIDMapped() {
+		return nil
+	}
+
+	if !m.IsBind() {
+		return fmt.Errorf("gidMappings/uidMappings is supported only for mounts with the option 'bind'")
+	}
+	if config.RootlessEUID {
+		return fmt.Errorf("gidMappings/uidMappings is not supported when runc is being launched with EUID != 0, needs CAP_SYS_ADMIN on the runc parent's user namespace")
+	}
+	if len(config.UIDMappings) == 0 || len(config.GIDMappings) == 0 {
+		return fmt.Errorf("not yet supported to use gidMappings/uidMappings in a mount without also using a user namespace")
+	}
+	if !sameMapping(config.UIDMappings, m.UIDMappings) {
+		return fmt.Errorf("not yet supported for the mount uidMappings to be different than user namespace uidMapping")
+	}
+	if !sameMapping(config.GIDMappings, m.GIDMappings) {
+		return fmt.Errorf("not yet supported for the mount gidMappings to be different than user namespace gidMapping")
+	}
+	if !filepath.IsAbs(m.Source) {
+		return fmt.Errorf("mount source not absolute")
 	}
 
 	return nil
+}
+
+func mountsWarn(config *configs.Config) error {
+	for _, m := range config.Mounts {
+		if !filepath.IsAbs(m.Destination) {
+			return fmt.Errorf("mount %+v: relative destination path is **deprecated**, using it as relative to /", m)
+		}
+	}
+	return nil
+}
+
+func mountsStrict(config *configs.Config) error {
+	for _, m := range config.Mounts {
+		if err := checkBindOptions(m); err != nil {
+			return fmt.Errorf("invalid mount %+v: %w", m, err)
+		}
+		if err := checkIDMapMounts(config, m); err != nil {
+			return fmt.Errorf("invalid mount %+v: %w", m, err)
+		}
+	}
+	return nil
+}
+
+// sameMapping checks if the mappings are the same. If the mappings are the same
+// but in different order, it returns false.
+func sameMapping(a, b []configs.IDMap) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i].ContainerID != b[i].ContainerID {
+			return false
+		}
+		if a[i].HostID != b[i].HostID {
+			return false
+		}
+		if a[i].Size != b[i].Size {
+			return false
+		}
+	}
+	return true
 }
 
 func isHostNetNS(path string) (bool, error) {
@@ -288,4 +395,25 @@ func isHostNetNS(path string) (bool, error) {
 	}
 
 	return (st1.Dev == st2.Dev) && (st1.Ino == st2.Ino), nil
+}
+
+// scheduler is to validate scheduler configs according to https://man7.org/linux/man-pages/man2/sched_setattr.2.html
+func scheduler(config *configs.Config) error {
+	s := config.Scheduler
+	if s == nil {
+		return nil
+	}
+	if s.Policy == "" {
+		return errors.New("scheduler policy is required")
+	}
+	if s.Nice < -20 || s.Nice > 19 {
+		return fmt.Errorf("invalid scheduler.nice: %d", s.Nice)
+	}
+	if s.Priority != 0 && (s.Policy != specs.SchedFIFO && s.Policy != specs.SchedRR) {
+		return errors.New("scheduler.priority can only be specified for SchedFIFO or SchedRR policy")
+	}
+	if s.Policy != specs.SchedDeadline && (s.Runtime != 0 || s.Deadline != 0 || s.Period != 0) {
+		return errors.New("scheduler runtime/deadline/period can only be specified for SchedDeadline policy")
+	}
+	return nil
 }

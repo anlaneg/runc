@@ -15,6 +15,8 @@
 
 You can find official releases of `runc` on the [release](https://github.com/opencontainers/runc/releases) page.
 
+All releases are signed by one of the keys listed in the [`runc.keyring` file in the root of this repository](runc.keyring).
+
 ## Security
 
 The reporting process and disclosure communications are outlined [here](https://github.com/opencontainers/org/blob/master/SECURITY.md).
@@ -24,7 +26,7 @@ A third party security audit was performed by Cure53, you can see the full repor
 
 ## Building
 
-`runc` only supports Linux. It must be built with Go version 1.17 or higher.
+`runc` only supports Linux. It must be built with Go version 1.19 or higher.
 
 In order to enable seccomp support you will need to install `libseccomp` on your platform.
 > e.g. `libseccomp-devel` for CentOS, or `libseccomp-dev` for Ubuntu
@@ -63,14 +65,19 @@ e.g. to disable seccomp:
 make BUILDTAGS=""
 ```
 
-| Build Tag | Feature                            | Enabled by default | Dependency |
-|-----------|------------------------------------|--------------------|------------|
-| seccomp   | Syscall filtering                  | yes                | libseccomp |
+| Build Tag     | Feature                               | Enabled by Default | Dependencies        |
+|---------------|---------------------------------------|--------------------|---------------------|
+| `seccomp`     | Syscall filtering using `libseccomp`. | yes                | `libseccomp`        |
+| `!runc_nodmz` | Reduce memory usage for CVE-2019-5736 protection by using a small C binary, [see `memfd-bind` for more details][contrib-memfd-bind]. `runc_nodmz` disables this feature and causes runc to use a different protection mechanism which will further increases memory usage temporarily during container startup. This feature can also be disabled at runtime by setting the `RUNC_DMZ=legacy` environment variable. | yes ||
+| `runc_dmz_selinux_nocompat` | Disables a SELinux DMZ workaround (new distros should set this). See [dmz README] for details. | no ||
 
 The following build tags were used earlier, but are now obsoleted:
  - **nokmem** (since runc v1.0.0-rc94 kernel memory settings are ignored)
  - **apparmor** (since runc v1.0.0-rc93 the feature is always enabled)
  - **selinux**  (since runc v1.0.0-rc93 the feature is always enabled)
+
+ [contrib-memfd-bind]: /contrib/cmd/memfd-bind/README.md
+ [dmz README]: /libcontainer/dmz/README.md
 
 ### Running the test suite
 
@@ -298,6 +305,7 @@ WantedBy=multi-user.target
 
 ## More documentation
 
+* [Spec conformance](./docs/spec-conformance.md)
 * [cgroup v2](./docs/cgroup-v2.md)
 * [Checkpoint and restore](./docs/checkpoint-restore.md)
 * [systemd cgroup driver](./docs/systemd.md)

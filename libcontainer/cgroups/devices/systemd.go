@@ -2,9 +2,9 @@ package devices
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
@@ -17,7 +17,7 @@ import (
 
 // systemdProperties takes the configured device rules and generates a
 // corresponding set of systemd properties to configure the devices correctly.
-func systemdProperties(r *configs.Resources) ([]systemdDbus.Property, error) {
+func systemdProperties(r *configs.Resources, sdVer int) ([]systemdDbus.Property, error) {
 	if r.SkipDevices {
 		return nil, nil
 	}
@@ -78,15 +78,17 @@ func systemdProperties(r *configs.Resources) ([]systemdDbus.Property, error) {
 		// trickery to convert things:
 		//
 		//  * Concrete rules with non-wildcard major/minor numbers have to use
-		//    /dev/{block,char} paths. This is slightly odd because it means
-		//    that we cannot add whitelist rules for devices that don't exist,
-		//    but there's not too much we can do about that.
+		//    /dev/{block,char}/MAJOR:minor paths. Before v240, systemd uses
+		//    stat(2) on such paths to look up device properties, meaning we
+		//    cannot add whitelist rules for devices that don't exist. Since v240,
+		//    device properties are parsed from the path string.
 		//
-		//    However, path globbing is not support for path-based rules so we
+		//    However, path globbing is not supported for path-based rules so we
 		//    need to handle wildcards in some other manner.
 		//
-		//  * Wildcard-minor rules have to specify a "device group name" (the
-		//    second column in /proc/devices).
+		//  * If systemd older than v240 is used, wildcard-minor rules
+		//    have to specify a "device group name" (the second column
+		//    in /proc/devices).
 		//
 		//  * Wildcard (major and minor) rules can just specify a glob with the
 		//    type ("char-*" or "block-*").
@@ -109,17 +111,26 @@ func systemdProperties(r *configs.Resources) ([]systemdDbus.Property, error) {
 			}
 			entry.Path = prefix + "*"
 		} else if rule.Minor == devices.Wildcard {
-			// "_ n:* _" rules require a device group from /proc/devices.
-			group, err := findDeviceGroup(rule.Type, rule.Major)
-			if err != nil {
-				return nil, fmt.Errorf("unable to find device '%v/%d': %w", rule.Type, rule.Major, err)
+			if sdVer >= 240 {
+				// systemd v240+ allows for {block,char}-MAJOR syntax.
+				prefix, err := groupPrefix(rule.Type)
+				if err != nil {
+					return nil, err
+				}
+				entry.Path = prefix + strconv.FormatInt(rule.Major, 10)
+			} else {
+				// For older systemd, "_ n:* _" rules require a device group from /proc/devices.
+				group, err := findDeviceGroup(rule.Type, rule.Major)
+				if err != nil {
+					return nil, fmt.Errorf("unable to find device '%v/%d': %w", rule.Type, rule.Major, err)
+				}
+				if group == "" {
+					// Couldn't find a group.
+					logrus.Warnf("could not find device group for '%v/%d' in /proc/devices -- temporarily ignoring rule: %v", rule.Type, rule.Major, *rule)
+					continue
+				}
+				entry.Path = group
 			}
-			if group == "" {
-				// Couldn't find a group.
-				logrus.Warnf("could not find device group for '%v/%d' in /proc/devices -- temporarily ignoring rule: %v", rule.Type, rule.Major, *rule)
-				continue
-			}
-			entry.Path = group
 		} else {
 			// "_ n:m _" rules are just a path in /dev/{block,char}/.
 			switch rule.Type {
@@ -127,6 +138,17 @@ func systemdProperties(r *configs.Resources) ([]systemdDbus.Property, error) {
 				entry.Path = fmt.Sprintf("/dev/block/%d:%d", rule.Major, rule.Minor)
 			case devices.CharDevice:
 				entry.Path = fmt.Sprintf("/dev/char/%d:%d", rule.Major, rule.Minor)
+			}
+			if sdVer < 240 {
+				// Old systemd versions use stat(2) on path to find out device major:minor
+				// numbers and type. If the path doesn't exist, it will not add the rule,
+				// emitting a warning instead.
+				// Since all of this logic is best-effort anyway (we manually set these
+				// rules separately to systemd) we can safely skip entries that don't
+				// have a corresponding path.
+				if _, err := os.Stat(entry.Path); err != nil {
+					continue
+				}
 			}
 		}
 		deviceAllowList = append(deviceAllowList, entry)
@@ -169,6 +191,7 @@ func findDeviceGroup(ruleType devices.Type, ruleMajor int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	ruleMajorStr := strconv.FormatInt(ruleMajor, 10) + " "
 
 	scanner := bufio.NewScanner(fh)
 	var currentType devices.Type
@@ -193,20 +216,9 @@ func findDeviceGroup(ruleType devices.Type, ruleMajor int64) (string, error) {
 			continue
 		}
 
-		// Parse out the (major, name).
-		var (
-			currMajor int64
-			currName  string
-		)
-		if n, err := fmt.Sscanf(line, "%d %s", &currMajor, &currName); err != nil || n != 2 {
-			if err == nil {
-				err = errors.New("wrong number of fields")
-			}
-			return "", fmt.Errorf("scan /proc/devices line %q: %w", line, err)
-		}
-
-		if currMajor == ruleMajor {
-			return prefix + currName, nil
+		group := strings.TrimPrefix(line, ruleMajorStr)
+		if len(group) < len(line) { // got it
+			return prefix + group, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {

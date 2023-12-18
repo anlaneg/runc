@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 
 	"github.com/opencontainers/selinux/go-selinux"
@@ -19,10 +20,12 @@ import (
 // linuxSetnsInit performs the container's initialization for running a new process
 // inside an existing container.
 type linuxSetnsInit struct {
-	pipe          *os.File
+	pipe          *syncSocket
 	consoleSocket *os.File
+	pidfdSocket   *os.File
 	config        *initConfig
 	logFd         int
+	dmzExe        *os.File
 }
 
 func (l *linuxSetnsInit) getSessionRingName() string {
@@ -54,11 +57,26 @@ func (l *linuxSetnsInit) Init() error {
 			return err
 		}
 	}
+	if l.pidfdSocket != nil {
+		if err := setupPidfd(l.pidfdSocket, "setns"); err != nil {
+			return fmt.Errorf("failed to setup pidfd: %w", err)
+		}
+	}
 	if l.config.NoNewPrivileges {
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 			return err
 		}
 	}
+	if l.config.Config.Umask != nil {
+		unix.Umask(int(*l.config.Config.Umask))
+	}
+
+	if l.config.Config.Scheduler != nil {
+		if err := setupScheduler(l.config.Config); err != nil {
+			return err
+		}
+	}
+
 	if err := selinux.SetExecLabel(l.config.ProcessLabel); err != nil {
 		return err
 	}
@@ -71,7 +89,6 @@ func (l *linuxSetnsInit) Init() error {
 		if err != nil {
 			return err
 		}
-
 		if err := syncParentSeccomp(l.pipe, seccompFd); err != nil {
 			return err
 		}
@@ -82,6 +99,23 @@ func (l *linuxSetnsInit) Init() error {
 	if err := apparmor.ApplyProfile(l.config.AppArmorProfile); err != nil {
 		return err
 	}
+	if l.config.Config.Personality != nil {
+		if err := setupPersonality(l.config.Config); err != nil {
+			return err
+		}
+	}
+	// Check for the arg early to make sure it exists.
+	name, err := exec.LookPath(l.config.Args[0])
+	if err != nil {
+		return err
+	}
+	// exec.LookPath in Go < 1.20 might return no error for an executable
+	// residing on a file system mounted with noexec flag, so perform this
+	// extra check now while we can still return a proper error.
+	// TODO: remove this once go < 1.20 is not supported.
+	if err := eaccess(name); err != nil {
+		return &os.PathError{Op: "eaccess", Path: name, Err: err}
+	}
 	// Set seccomp as close to execve as possible, so as few syscalls take
 	// place afterward (reducing the amount of syscalls that users need to
 	// enable in their seccomp profiles).
@@ -90,16 +124,20 @@ func (l *linuxSetnsInit) Init() error {
 		if err != nil {
 			return fmt.Errorf("unable to init seccomp: %w", err)
 		}
-
 		if err := syncParentSeccomp(l.pipe, seccompFd); err != nil {
 			return err
 		}
 	}
-	logrus.Debugf("setns_init: about to exec")
+
 	// Close the log pipe fd so the parent's ForwardLogs can exit.
+	logrus.Debugf("setns_init: about to exec")
 	if err := unix.Close(l.logFd); err != nil {
 		return &os.PathError{Op: "close log pipe", Path: "fd " + strconv.Itoa(l.logFd), Err: err}
 	}
 
-	return system.Execv(l.config.Args[0], l.config.Args[0:], os.Environ())
+	if l.dmzExe != nil {
+		l.config.Args[0] = name
+		return system.Fexecve(l.dmzExe.Fd(), l.config.Args, os.Environ())
+	}
+	return system.Exec(name, l.config.Args, os.Environ())
 }

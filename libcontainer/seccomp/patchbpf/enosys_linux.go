@@ -43,6 +43,11 @@ const uintptr_t C_SET_MODE_FILTER = SECCOMP_SET_MODE_FILTER;
 #endif
 const uintptr_t C_FILTER_FLAG_LOG = SECCOMP_FILTER_FLAG_LOG;
 
+#ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+#	define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1UL << 2)
+#endif
+const uintptr_t C_FILTER_FLAG_SPEC_ALLOW = SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #	define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
 #endif
@@ -84,7 +89,7 @@ var retErrnoEnosys = uint32(C.C_ACT_ERRNO_ENOSYS)
 const bpfSizeofInt = 4
 
 // This syscall is used for multiplexing "large" syscalls on s390(x). Unknown
-// syscalls will end up with this syscall number, so we need to explcitly
+// syscalls will end up with this syscall number, so we need to explicitly
 // return -ENOSYS for this syscall on those architectures.
 const s390xMultiplexSyscall libseccomp.ScmpSyscall = 0
 
@@ -233,16 +238,6 @@ func findLastSyscalls(config *configs.Seccomp) (lastSyscallMap, error) {
 		arch, err := libseccomp.GetArchFromString(ociArch)
 		if err != nil {
 			return nil, fmt.Errorf("unable to validate seccomp architecture: %w", err)
-		}
-
-		// Map native architecture to a real architecture value to avoid
-		// doubling-up the lastSyscall mapping.
-		if arch == libseccomp.ArchNative {
-			nativeArch, err := libseccomp.GetNativeArch()
-			if err != nil {
-				return nil, fmt.Errorf("unable to get native architecture: %w", err)
-			}
-			arch = nativeArch
 		}
 
 		// Figure out native architecture representation of the architecture.
@@ -641,8 +636,14 @@ func filterFlags(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (flags 
 			flags |= uint(C.C_FILTER_FLAG_LOG)
 		}
 	}
-
-	// TODO: Support seccomp flags not yet added to libseccomp-golang...
+	if apiLevel >= 4 {
+		if ssb, err := filter.GetSSB(); err != nil {
+			return 0, false, fmt.Errorf("unable to fetch SECCOMP_FILTER_FLAG_SPEC_ALLOW bit: %w", err)
+		} else if ssb {
+			flags |= uint(C.C_FILTER_FLAG_SPEC_ALLOW)
+		}
+	}
+	// XXX: add newly supported filter flags above this line.
 
 	for _, call := range config.Syscalls {
 		if call.Action == configs.Notify {
@@ -655,6 +656,9 @@ func filterFlags(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (flags 
 }
 
 func sysSeccompSetFilter(flags uint, filter []unix.SockFilter) (fd int, err error) {
+	// This debug output is validated in tests/integration/seccomp.bats
+	// by the SECCOMP_FILTER_FLAG_* test.
+	logrus.Debugf("seccomp filter flags: %d", flags)
 	fprog := unix.SockFprog{
 		Len:    uint16(len(filter)),
 		Filter: &filter[0],
@@ -686,17 +690,17 @@ func sysSeccompSetFilter(flags uint, filter []unix.SockFilter) (fd int, err erro
 // patches said filter to handle -ENOSYS in a much nicer manner than the
 // default libseccomp default action behaviour, and loads the patched filter
 // into the kernel for the current process.
-func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, error) {
+func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (*os.File, error) {
 	// Generate a patched filter.
 	fprog, err := enosysPatchFilter(config, filter)
 	if err != nil {
-		return -1, fmt.Errorf("error patching filter: %w", err)
+		return nil, fmt.Errorf("error patching filter: %w", err)
 	}
 
 	// Get the set of libseccomp flags set.
 	seccompFlags, noNewPrivs, err := filterFlags(config, filter)
 	if err != nil {
-		return -1, fmt.Errorf("unable to fetch seccomp filter flags: %w", err)
+		return nil, fmt.Errorf("unable to fetch seccomp filter flags: %w", err)
 	}
 
 	// Set no_new_privs if it was requested, though in runc we handle
@@ -704,15 +708,14 @@ func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, 
 	if noNewPrivs {
 		logrus.Warnf("potentially misconfigured filter -- setting no_new_privs in seccomp path")
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-			return -1, fmt.Errorf("error enabling no_new_privs bit: %w", err)
+			return nil, fmt.Errorf("error enabling no_new_privs bit: %w", err)
 		}
 	}
 
 	// Finally, load the filter.
 	fd, err := sysSeccompSetFilter(seccompFlags, fprog)
 	if err != nil {
-		return -1, fmt.Errorf("error loading seccomp filter: %w", err)
+		return nil, fmt.Errorf("error loading seccomp filter: %w", err)
 	}
-
-	return fd, nil
+	return os.NewFile(uintptr(fd), "[seccomp filter]"), nil
 }

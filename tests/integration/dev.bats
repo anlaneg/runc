@@ -40,7 +40,6 @@ function teardown() {
 			| .linux.devices = [{"path": "/dev/kmsg", "type": "c", "major": 1, "minor": 11}]
 			| .process.capabilities.bounding += ["CAP_SYSLOG"]
 			| .process.capabilities.effective += ["CAP_SYSLOG"]
-			| .process.capabilities.inheritable += ["CAP_SYSLOG"]
 			| .process.capabilities.permitted += ["CAP_SYSLOG"]
 			| .process.args |= ["sh"]'
 
@@ -78,7 +77,6 @@ function teardown() {
 			| .process.args |= ["sh"]
 			| .process.capabilities.bounding += ["CAP_SYSLOG"]
 			| .process.capabilities.effective += ["CAP_SYSLOG"]
-			| .process.capabilities.inheritable += ["CAP_SYSLOG"]
 			| .process.capabilities.permitted += ["CAP_SYSLOG"]
 			| .hostname = "myhostname"'
 
@@ -114,7 +112,6 @@ function teardown() {
 			| .process.args |= ["sh"]
 			| .process.capabilities.bounding += ["CAP_MKNOD"]
 			| .process.capabilities.effective += ["CAP_MKNOD"]
-			| .process.capabilities.inheritable += ["CAP_MKNOD"]
 			| .process.capabilities.permitted += ["CAP_MKNOD"]'
 
 	runc run -d --console-socket "$CONSOLE_SOCKET" test_allow_block
@@ -126,5 +123,21 @@ function teardown() {
 
 	# test read
 	runc exec test_allow_block sh -c 'fdisk -l '"$device"''
+	[ "$status" -eq 0 ]
+}
+
+# https://github.com/opencontainers/runc/issues/3551
+@test "runc exec vs systemctl daemon-reload" {
+	requires systemd root
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_exec
+	[ "$status" -eq 0 ]
+
+	runc exec -t test_exec sh -c "ls -l /proc/self/fd/0; echo 123"
+	[ "$status" -eq 0 ]
+
+	systemctl daemon-reload
+
+	runc exec -t test_exec sh -c "ls -l /proc/self/fd/0; echo 123"
 	[ "$status" -eq 0 ]
 }

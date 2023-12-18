@@ -10,6 +10,72 @@ function teardown() {
 	teardown_bundle
 }
 
+# See also: "kill KILL [host pidns + init gone]" test in kill.bats.
+#
+# This needs to be placed at the top of the bats file to work around
+# a shellcheck bug. See <https://github.com/koalaman/shellcheck/issues/2873>.
+function test_runc_delete_host_pidns() {
+	requires cgroups_freezer
+
+	update_config '	  .linux.namespaces -= [{"type": "pid"}]'
+	set_cgroups_path
+	if [ $EUID -ne 0 ]; then
+		requires rootless_cgroup
+		# Apparently, for rootless test, when using systemd cgroup manager,
+		# newer versions of systemd clean up the container as soon as its init
+		# process is gone. This is all fine and dandy, except it prevents us to
+		# test this case, thus we skip the test.
+		#
+		# It is not entirely clear which systemd version got this feature:
+		# v245 works fine, and v249 does not.
+		if [ -v RUNC_USE_SYSTEMD ] && [ "$(systemd_version)" -gt 245 ]; then
+			skip "rootless+systemd conflicts with systemd > 245"
+		fi
+		# Can't mount real /proc when rootless + no pidns,
+		# so change it to a bind-mounted one from the host.
+		update_config '	  .mounts |= map((select(.type == "proc")
+					| .type = "none"
+					| .source = "/proc"
+					| .options = ["rbind", "nosuid", "nodev", "noexec"]
+				  ) // .)'
+	fi
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test_busybox
+	[ "$status" -eq 0 ]
+	cgpath=$(get_cgroup_path "pids")
+	init_pid=$(cat "$cgpath"/cgroup.procs)
+
+	# Start a few more processes.
+	for _ in 1 2 3 4 5; do
+		__runc exec -d test_busybox sleep 1h
+	done
+
+	# Now kill the container's init process. Since the container do
+	# not have own PID ns, its init is no special and the container
+	# will still be up and running.
+	kill -9 "$init_pid"
+
+	# Get the list of all container processes.
+	pids=$(cat "$cgpath"/cgroup.procs)
+	echo "pids: $pids"
+	# Sanity check -- make sure all processes exist.
+	for p in $pids; do
+		kill -0 "$p"
+	done
+
+	# Must kill those processes and remove container.
+	runc delete "$@" test_busybox
+	[ "$status" -eq 0 ]
+
+	runc state test_busybox
+	[ "$status" -ne 0 ] # "Container does not exist"
+
+	# Make sure all processes are gone.
+	pids=$(cat "$cgpath"/cgroup.procs) || true # OK if cgroup is gone
+	echo "pids: $pids"
+	[ -z "$pids" ]
+}
+
 @test "runc delete" {
 	# Need a permission to create a cgroup.
 	# XXX(@kolyshkin): currently this test does not handle rootless when
@@ -23,7 +89,7 @@ function teardown() {
 
 	testcontainer testbusyboxdelete running
 	# Ensure the find statement used later is correct.
-	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope)
+	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
 	if [ -z "$output" ]; then
 		fail "expected cgroup not found"
 	fi
@@ -38,7 +104,7 @@ function teardown() {
 	runc state testbusyboxdelete
 	[ "$status" -ne 0 ]
 
-	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope)
+	output=$(find /sys/fs/cgroup -name testbusyboxdelete -o -name \*-testbusyboxdelete.scope 2>/dev/null || true)
 	[ "$output" = "" ] || fail "cgroup not cleaned up correctly: $output"
 }
 
@@ -60,6 +126,16 @@ function teardown() {
 @test "runc delete --force ignore not exist" {
 	runc delete --force notexists
 	[ "$status" -eq 0 ]
+}
+
+# Issue 4047, case "runc delete".
+@test "runc delete [host pidns + init gone]" {
+	test_runc_delete_host_pidns
+}
+
+# Issue 4047, case "runc delete --force" (different code path).
+@test "runc delete --force [host pidns + init gone]" {
+	test_runc_delete_host_pidns --force
 }
 
 @test "runc delete --force [paused container]" {
@@ -118,7 +194,7 @@ EOF
 	runc state test_busybox
 	[ "$status" -ne 0 ]
 
-	output=$(find /sys/fs/cgroup -wholename '*testbusyboxdelete*' -type d)
+	output=$(find /sys/fs/cgroup -wholename '*testbusyboxdelete*' -type d 2>/dev/null || true)
 	[ "$output" = "" ] || fail "cgroup not cleaned up correctly: $output"
 }
 
@@ -157,7 +233,7 @@ EOF
 	[[ "$output" =~ [0-9]+ ]]
 
 	# check create subcgroups success
-	[ -d "$CGROUP_PATH"/foo ]
+	[ -d "$CGROUP_V2_PATH"/foo ]
 
 	# force delete test_busybox
 	runc delete --force test_busybox
@@ -166,5 +242,31 @@ EOF
 	[ "$status" -ne 0 ]
 
 	# check delete subcgroups success
-	[ ! -d "$CGROUP_PATH"/foo ]
+	[ ! -d "$CGROUP_V2_PATH"/foo ]
+}
+
+@test "runc delete removes failed systemd unit" {
+	requires systemd_v244 # Older systemd lacks RuntimeMaxSec support.
+
+	set_cgroups_path
+	update_config '	  .annotations += {
+				"org.systemd.property.RuntimeMaxSec": "2",
+				"org.systemd.property.TimeoutStopSec": "1"
+			   }
+			| .process.args |= ["/bin/sleep", "10"]'
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test-failed-unit
+	[ "$status" -eq 0 ]
+
+	wait_for_container 10 1 test-failed-unit stopped
+
+	local user=""
+	[ $EUID -ne 0 ] && user="--user"
+
+	# Expect "unit is not active" exit code.
+	run -3 systemctl status $user "$SD_UNIT_NAME"
+
+	runc delete test-failed-unit
+	# Expect "no such unit" exit code.
+	run -4 systemctl status $user "$SD_UNIT_NAME"
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
+	"github.com/opencontainers/runc/libcontainer/userns"
 	libcontainerUtils "github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -49,6 +50,7 @@ func initMaps() {
 			specs.IPCNamespace:     configs.NEWIPC,
 			specs.UTSNamespace:     configs.NEWUTS,
 			specs.CgroupNamespace:  configs.NEWCGROUP,
+			specs.TimeNamespace:    configs.NEWTIME,
 		}
 
 		mountPropagationMapping = map[string]int{
@@ -66,7 +68,7 @@ func initMaps() {
 			clear bool
 			flag  int
 		}{
-			"acl":           {false, unix.MS_POSIXACL},
+			// "acl" cannot be mapped to MS_POSIXACL: https://github.com/opencontainers/runc/issues/3738
 			"async":         {true, unix.MS_SYNCHRONOUS},
 			"atime":         {true, unix.MS_NOATIME},
 			"bind":          {false, unix.MS_BIND},
@@ -79,7 +81,6 @@ func initMaps() {
 			"lazytime":      {false, unix.MS_LAZYTIME},
 			"loud":          {true, unix.MS_SILENT},
 			"mand":          {false, unix.MS_MANDLOCK},
-			"noacl":         {true, unix.MS_POSIXACL},
 			"noatime":       {false, unix.MS_NOATIME},
 			"nodev":         {false, unix.MS_NODEV},
 			"nodiratime":    {false, unix.MS_NODIRATIME},
@@ -173,18 +174,19 @@ func KnownMountOptions() []string {
 // AllowedDevices is the set of devices which are automatically included for
 // all containers.
 //
-// XXX (cyphar)
-//    This behaviour is at the very least "questionable" (if not outright
-//    wrong) according to the runtime-spec.
+// # XXX (cyphar)
 //
-//    Yes, we have to include certain devices other than the ones the user
-//    specifies, but several devices listed here are not part of the spec
-//    (including "mknod for any device"?!). In addition, these rules are
-//    appended to the user-provided set which means that users *cannot disable
-//    this behaviour*.
+// This behaviour is at the very least "questionable" (if not outright
+// wrong) according to the runtime-spec.
 //
-//    ... unfortunately I'm too scared to change this now because who knows how
-//    many people depend on this (incorrect and arguably insecure) behaviour.
+// Yes, we have to include certain devices other than the ones the user
+// specifies, but several devices listed here are not part of the spec
+// (including "mknod for any device"?!). In addition, these rules are
+// appended to the user-provided set which means that users *cannot disable
+// this behaviour*.
+//
+// ... unfortunately I'm too scared to change this now because who knows how
+// many people depend on this (incorrect and arguably insecure) behaviour.
 var AllowedDevices = []*devices.Device{
 	// allow mknod for any device
 	{
@@ -321,7 +323,6 @@ func getwd() (wd string, err error) {
 	for {
 		/*取当前工作目录*/
 		wd, err = unix.Getwd()
-		//nolint:errorlint // unix errors are bare
 		if err != unix.EINTR {
 			break
 		}
@@ -360,6 +361,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		NoPivotRoot:     opts.NoPivotRoot,
 		Readonlyfs:      spec.Root.Readonly,
 		Hostname:        spec.Hostname,
+		Domainname:      spec.Domainname,
 		Labels:          append(labels, "bundle="+cwd),
 		NoNewKeyring:    opts.NoNewKeyring,
 		RootlessEUID:    opts.RootlessEUID,
@@ -427,6 +429,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		config.ReadonlyPaths = spec.Linux.ReadonlyPaths
 		config.MountLabel = spec.Linux.MountLabel
 		config.Sysctl = spec.Linux.Sysctl
+		config.TimeOffsets = spec.Linux.TimeOffsets
 		if spec.Linux.Seccomp != nil {
 			seccomp, err := SetupSeccomp(spec.Linux.Seccomp)
 			if err != nil {
@@ -439,6 +442,18 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 				ClosID:        spec.Linux.IntelRdt.ClosID,
 				L3CacheSchema: spec.Linux.IntelRdt.L3CacheSchema,
 				MemBwSchema:   spec.Linux.IntelRdt.MemBwSchema,
+			}
+		}
+		if spec.Linux.Personality != nil {
+			if len(spec.Linux.Personality.Flags) > 0 {
+				logrus.Warnf("ignoring unsupported personality flags: %+v because personality flag has not supported at this time", spec.Linux.Personality.Flags)
+			}
+			domain, err := getLinuxPersonalityFromStr(string(spec.Linux.Personality.Domain))
+			if err != nil {
+				return nil, err
+			}
+			config.Personality = &configs.LinuxPersonality{
+				Domain: domain,
 			}
 		}
 	}
@@ -499,10 +514,29 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 				Ambient:     spec.Process.Capabilities.Ambient,
 			}
 		}
+		if spec.Process.Scheduler != nil {
+			s := *spec.Process.Scheduler
+			config.Scheduler = &s
+		}
 	}
 	createHooks(spec, config)
 	config.Version = specs.Version
 	return config, nil
+}
+
+func toConfigIDMap(specMaps []specs.LinuxIDMapping) []configs.IDMap {
+	if specMaps == nil {
+		return nil
+	}
+	idmaps := make([]configs.IDMap, len(specMaps))
+	for i, id := range specMaps {
+		idmaps[i] = configs.IDMap{
+			ContainerID: int64(id.ContainerID),
+			HostID:      int64(id.HostID),
+			Size:        int64(id.Size),
+		}
+	}
+	return idmaps
 }
 
 func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) {
@@ -526,6 +560,9 @@ func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) 
 			mnt.Source = filepath.Join(cwd, m.Source)
 		}
 	}
+
+	mnt.UIDMappings = toConfigIDMap(m.UIDMappings)
+	mnt.GIDMappings = toConfigIDMap(m.GIDMappings)
 
 	// None of the mount arguments can contain a null byte. Normally such
 	// strings would either cause some other failure or would just be truncated
@@ -557,6 +594,16 @@ func checkPropertyName(s string) error {
 		return errors.New("contains non-alphabetic character")
 	}
 	return nil
+}
+
+// getLinuxPersonalityFromStr converts the string domain received from spec to equivalent integer.
+func getLinuxPersonalityFromStr(domain string) (int, error) {
+	if domain == string(specs.PerLinux32) {
+		return configs.PerLinux32, nil
+	} else if domain == string(specs.PerLinux) {
+		return configs.PerLinux, nil
+	}
+	return -1, fmt.Errorf("invalid personality domain %s", domain)
 }
 
 // Some systemd properties are documented as having "Sec" suffix
@@ -731,6 +778,9 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				if r.Memory.DisableOOMKiller != nil {
 					c.Resources.OomKillDisable = *r.Memory.DisableOOMKiller
 				}
+				if r.Memory.CheckBeforeUpdate != nil {
+					c.Resources.MemoryCheckBeforeUpdate = *r.Memory.CheckBeforeUpdate
+				}
 			}
 			if r.CPU != nil {
 				if r.CPU.Shares != nil {
@@ -741,6 +791,9 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				}
 				if r.CPU.Quota != nil {
 					c.Resources.CpuQuota = *r.CPU.Quota
+				}
+				if r.CPU.Burst != nil {
+					c.Resources.CpuBurst = r.CPU.Burst
 				}
 				if r.CPU.Period != nil {
 					c.Resources.CpuPeriod = *r.CPU.Period
@@ -753,6 +806,7 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				}
 				c.Resources.CpusetCpus = r.CPU.Cpus
 				c.Resources.CpusetMems = r.CPU.Mems
+				c.Resources.CPUIdle = r.CPU.Idle
 			}
 			if r.Pids != nil {
 				c.Resources.PidsLimit = r.Pids.Limit
@@ -764,46 +818,36 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				if r.BlockIO.LeafWeight != nil {
 					c.Resources.BlkioLeafWeight = *r.BlockIO.LeafWeight
 				}
-				if r.BlockIO.WeightDevice != nil {
-					for _, wd := range r.BlockIO.WeightDevice {
-						var weight, leafWeight uint16
-						if wd.Weight != nil {
-							weight = *wd.Weight
-						}
-						if wd.LeafWeight != nil {
-							leafWeight = *wd.LeafWeight
-						}
-						weightDevice := configs.NewWeightDevice(wd.Major, wd.Minor, weight, leafWeight)
-						c.Resources.BlkioWeightDevice = append(c.Resources.BlkioWeightDevice, weightDevice)
+				for _, wd := range r.BlockIO.WeightDevice {
+					var weight, leafWeight uint16
+					if wd.Weight != nil {
+						weight = *wd.Weight
 					}
+					if wd.LeafWeight != nil {
+						leafWeight = *wd.LeafWeight
+					}
+					weightDevice := configs.NewWeightDevice(wd.Major, wd.Minor, weight, leafWeight)
+					c.Resources.BlkioWeightDevice = append(c.Resources.BlkioWeightDevice, weightDevice)
 				}
-				if r.BlockIO.ThrottleReadBpsDevice != nil {
-					for _, td := range r.BlockIO.ThrottleReadBpsDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleReadBpsDevice = append(c.Resources.BlkioThrottleReadBpsDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleReadBpsDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleReadBpsDevice = append(c.Resources.BlkioThrottleReadBpsDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleWriteBpsDevice != nil {
-					for _, td := range r.BlockIO.ThrottleWriteBpsDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleWriteBpsDevice = append(c.Resources.BlkioThrottleWriteBpsDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleWriteBpsDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleWriteBpsDevice = append(c.Resources.BlkioThrottleWriteBpsDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleReadIOPSDevice != nil {
-					for _, td := range r.BlockIO.ThrottleReadIOPSDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleReadIOPSDevice = append(c.Resources.BlkioThrottleReadIOPSDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleReadIOPSDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleReadIOPSDevice = append(c.Resources.BlkioThrottleReadIOPSDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleWriteIOPSDevice != nil {
-					for _, td := range r.BlockIO.ThrottleWriteIOPSDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleWriteIOPSDevice = append(c.Resources.BlkioThrottleWriteIOPSDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleWriteIOPSDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleWriteIOPSDevice = append(c.Resources.BlkioThrottleWriteIOPSDevice, throttleDevice)
 				}
 			}
 			for _, l := range r.HugepageLimits {
@@ -933,20 +977,43 @@ next:
 }
 
 func setupUserNamespace(spec *specs.Spec, config *configs.Config) error {
-	create := func(m specs.LinuxIDMapping) configs.IDMap {
-		return configs.IDMap{
-			HostID:      int(m.HostID),
-			ContainerID: int(m.ContainerID),
-			Size:        int(m.Size),
-		}
-	}
 	if spec.Linux != nil {
-		for _, m := range spec.Linux.UIDMappings {
-			config.UidMappings = append(config.UidMappings, create(m))
+		config.UIDMappings = toConfigIDMap(spec.Linux.UIDMappings)
+		config.GIDMappings = toConfigIDMap(spec.Linux.GIDMappings)
+	}
+	if path := config.Namespaces.PathOf(configs.NEWUSER); path != "" {
+		// Cache the current userns mappings in our configuration, so that we
+		// can calculate uid and gid mappings within runc. These mappings are
+		// never used for configuring the container if the path is set.
+		uidMap, gidMap, err := userns.GetUserNamespaceMappings(path)
+		if err != nil {
+			return fmt.Errorf("failed to cache mappings for userns: %w", err)
 		}
-		for _, m := range spec.Linux.GIDMappings {
-			config.GidMappings = append(config.GidMappings, create(m))
+		// We cannot allow uid or gid mappings to be set if we are also asked
+		// to join a userns.
+		if config.UIDMappings != nil || config.GIDMappings != nil {
+			// FIXME: It turns out that containerd and CRIO pass both a userns
+			// path and the mappings of the namespace in the same config.json.
+			// Such a configuration is technically not valid, but we used to
+			// require mappings be specified, and thus users worked around our
+			// bug -- so we can't regress it at the moment. But we also don't
+			// want to produce broken behaviour if the mapping doesn't match
+			// the userns. So (for now) we output a warning if the actual
+			// userns mappings match the configuration, otherwise we return an
+			// error.
+			if !userns.IsSameMapping(uidMap, config.UIDMappings) ||
+				!userns.IsSameMapping(gidMap, config.GIDMappings) {
+				return errors.New("user namespaces enabled, but both namespace path and non-matching mapping specified -- you may only provide one")
+			}
+			logrus.Warnf("config.json has both a userns path to join and a matching userns mapping specified -- you may only provide one. Future versions of runc may return an error with this configuration, please report a bug on <https://github.com/opencontainers/runc> if you see this warning and cannot update your configuration.")
 		}
+
+		config.UIDMappings = uidMap
+		config.GIDMappings = gidMap
+		logrus.WithFields(logrus.Fields{
+			"uid_map": uidMap,
+			"gid_map": gidMap,
+		}).Debugf("config uses path-based userns configuration -- current uid and gid mappings cached")
 	}
 	rootUID, err := config.HostRootUID()
 	if err != nil {
@@ -977,10 +1044,15 @@ func parseMountOptions(options []string) *configs.Mount {
 		// or the flag is not supported on the platform,
 		// then it is a data value for a specific fs type.
 		if f, exists := mountFlags[o]; exists && f.flag != 0 {
+			// FIXME: The *atime flags are special (they are more of an enum
+			// with quite hairy semantics) and thus arguably setting some of
+			// them should clear unrelated flags.
 			if f.clear {
 				m.Flags &= ^f.flag
+				m.ClearedFlags |= f.flag
 			} else {
 				m.Flags |= f.flag
+				m.ClearedFlags &= ^f.flag
 			}
 		} else if f, exists := mountPropagationMapping[o]; exists && f != 0 {
 			m.PropagationFlags = append(m.PropagationFlags, f)
@@ -1025,13 +1097,27 @@ func SetupSeccomp(config *specs.LinuxSeccomp) (*configs.Seccomp, error) {
 		return nil, nil
 	}
 
-	// We don't currently support seccomp flags.
-	if len(config.Flags) != 0 {
-		return nil, errors.New("seccomp flags are not yet supported by runc")
-	}
-
 	newConfig := new(configs.Seccomp)
 	newConfig.Syscalls = []*configs.Syscall{}
+
+	// The list of flags defined in runtime-spec is a subset of the flags
+	// in the seccomp() syscall.
+	if config.Flags == nil {
+		// No flags are set explicitly (not even the empty set);
+		// set the default of specs.LinuxSeccompFlagSpecAllow,
+		// if it is supported by the libseccomp and the kernel.
+		if err := seccomp.FlagSupported(specs.LinuxSeccompFlagSpecAllow); err == nil {
+			newConfig.Flags = []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagSpecAllow}
+		}
+	} else {
+		// Fail early if some flags are unknown or unsupported.
+		for _, flag := range config.Flags {
+			if err := seccomp.FlagSupported(flag); err != nil {
+				return nil, err
+			}
+			newConfig.Flags = append(newConfig.Flags, flag)
+		}
+	}
 
 	if len(config.Architectures) > 0 {
 		newConfig.Architectures = []string{}

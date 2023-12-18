@@ -23,29 +23,16 @@ function as the entry of "bootstrap".
 In addition to the go init function the early stage bootstrap is handled by importing
 [nsenter](https://github.com/opencontainers/runc/blob/master/libcontainer/nsenter/README.md).
 
-```go
-import (
-	_ "github.com/opencontainers/runc/libcontainer/nsenter"
-)
-
-func init() {
-	if len(os.Args) > 1 && os.Args[1] == "init" {
-		runtime.GOMAXPROCS(1)
-		runtime.LockOSThread()
-		if err := libcontainer.StartInitialization(); err != nil {
-			logrus.Fatal(err)
-		}
-		panic("--this line should have never been executed, congratulations--")
-	}
-}
-```
+For details on how runc implements such "init", see
+[init.go](https://github.com/opencontainers/runc/blob/master/init.go)
+and [libcontainer/init_linux.go](https://github.com/opencontainers/runc/blob/master/libcontainer/init_linux.go).
 
 Then to create a container you first have to create a configuration
 struct describing how the container is to be created. A sample would look similar to this:
 
 ```go
 defaultMountFlags := unix.MS_NOEXEC | unix.MS_NOSUID | unix.MS_NODEV
-var devices []*configs.DeviceRule
+var devices []*devices.Rule
 for _, device := range specconv.AllowedDevices {
 	devices = append(devices, &device.Rule)
 }
@@ -184,14 +171,14 @@ config := &configs.Config{
 			Flags:       defaultMountFlags | unix.MS_RDONLY,
 		},
 	},
-	UidMappings: []configs.IDMap{
+	UIDMappings: []configs.IDMap{
 		{
 			ContainerID: 0,
 			HostID: 1000,
 			Size: 65536,
 		},
 	},
-	GidMappings: []configs.IDMap{
+	GIDMappings: []configs.IDMap{
 		{
 			ContainerID: 0,
 			HostID: 1000,
